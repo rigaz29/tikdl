@@ -1,0 +1,22 @@
+{
+  "name": "tiktok-downloader-bot",
+  "version": "2.0.0",
+  "description": "Telegram TikTok Downloader — JS API primary + yt-dlp fallback",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "dependencies": {
+    "@grammyjs/ratelimiter": "^1.2.0",
+    "@grammyjs/runner": "^2.0.3",
+    "@tobyg74/tiktok-api-dl": "^1.1.1",
+    "axios": "^1.7.9",
+    "bottleneck": "^2.19.5",
+    "dotenv": "^16.4.7",
+    "grammy": "^1.35.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
