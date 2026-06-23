@@ -650,12 +650,15 @@ async function sendVideoStream(ctx, data, apiVersion, statusMsg) {
   const caption = buildCaption(data, "video", apiVersion, "API");
 
   // Send as a document (uncompressed) — Telegram re-encodes playable videos.
+  // disable_content_type_detection keeps it a plain file instead of letting
+  // Telegram auto-render the .mp4 as an inline playable video.
   const filename = buildVideoFilename(data);
 
   await withTelegramRetry(() =>
     ctx.replyWithDocument(new InputFile(stream, filename), {
       caption,
       parse_mode: "Markdown",
+      disable_content_type_detection: true,
     })
   );
 
@@ -788,10 +791,13 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
       metrics.audio++;
     } else {
       // Send as a document (uncompressed) — Telegram re-encodes playable videos.
+      // disable_content_type_detection keeps it a plain file instead of an
+      // inline playable video.
       await withTelegramRetry(() =>
         ctx.replyWithDocument(new InputFile(fileStream, filename), {
           caption,
           parse_mode: "Markdown",
+          disable_content_type_detection: true,
         })
       );
       metrics.videos++;
