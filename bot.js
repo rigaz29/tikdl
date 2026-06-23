@@ -1077,16 +1077,14 @@ async function main() {
   }
 
   const runner = run(bot, {
-  runner: {
-    fetch: {
-      allowed_updates: CONFIG.bot.allowedUpdates,
+    runner: {
+      fetch: {
+        allowed_updates: CONFIG.bot.allowedUpdates,
+      },
+      retryInterval: "exponential", // backoff between failed getUpdates calls
+      maxRetryTime: 30 * 60_000,    // keep retrying getUpdates for up to 30 min
     },
-    retry: {
-      maxDelaySecs: 30,     // max wait before retry
-      maxRetryAttempts: 10, // retry up to 10x before giving up
-    },
-  },
-});
+  });
 
   startCleanupInterval();
 
