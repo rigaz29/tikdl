@@ -177,7 +177,7 @@ function buildAxiosConfig(useCookies = true) {
   };
 }
 
-async function downloadStream(url) {
+async function downloadStream(url, maxBytes = 0) {
   const tryDownload = async (useCookies) => {
     const resp = await axios({
       ...buildAxiosConfig(useCookies),
@@ -185,6 +185,19 @@ async function downloadStream(url) {
       url,
       responseType: "stream",
     });
+
+    // Reject oversized content early (before streaming the whole body) so the
+    // cascade can fall back to yt-dlp, which can select a smaller format.
+    if (maxBytes > 0) {
+      const len = Number(resp.headers["content-length"]);
+      if (Number.isFinite(len) && len > maxBytes) {
+        resp.data.destroy();
+        const e = new Error(`File too large: ${formatBytes(len)} (max ${formatBytes(maxBytes)})`);
+        e.code = "FILE_TOO_LARGE";
+        throw e;
+      }
+    }
+
     const pass = new PassThrough();
     pass.on("error", (err) => log("WARN", `Stream error: ${err.message}`));
     resp.data.on("error", (err) => pass.destroy(err));
@@ -195,6 +208,8 @@ async function downloadStream(url) {
   try {
     return await tryDownload(true);
   } catch (err) {
+    // Oversize is not an auth problem — don't waste a second request retrying.
+    if (err.code === "FILE_TOO_LARGE") throw err;
     if (cookieString) {
       log("WARN", `Download retry without cookies: ${err.message}`);
       return tryDownload(false);
@@ -208,7 +223,7 @@ async function downloadStream(url) {
 // ──────────────────────────────────────────────
 
 const TIKTOK_URL_RE =
-  /https?:\/\/(?:www\.)?(?:tiktok\.com|vt\.tiktok\.com|vm\.tiktok\.com)\/\S+/gi;
+  /https?:\/\/(?:[\w-]+\.)?tiktok\.com\/\S+/gi;
 
 function extractTikTokUrls(text) {
   return (text.match(TIKTOK_URL_RE) || []).map((u) => u.replace(/[)\]}>]+$/, ""));
@@ -282,15 +297,21 @@ function checkYtdlp() {
  * @param {boolean} useCookies
  * @returns {{ filepath: string, metadata: object }}
  */
-function ytdlpDownload(url, useCookies = false) {
+function ytdlpDownload(url, useCookies = false, mode = "auto") {
   return new Promise((resolve, reject) => {
     const tempDir = fs.mkdtempSync(path.join(CONFIG.ytdlp.tempDir, "dl-"));
     const outputTpl = path.join(tempDir, "%(title).100B.%(ext)s");
     const maxSize = CONFIG.download.maxFileSizeMB;
 
+    // For /audio fallback, grab an audio-only stream instead of the full video.
+    const format =
+      mode === "audio"
+        ? `bestaudio[filesize<${maxSize}M]/bestaudio/best[filesize<${maxSize}M]/best`
+        : `best[filesize<${maxSize}M]/best`;
+
     const args = [
       "--no-playlist",
-      "--format", `best[filesize<${maxSize}M]/best`,
+      "--format", format,
       "--max-filesize", `${maxSize}M`,
       "--socket-timeout", "30",
       "--retries", "3",
@@ -308,6 +329,7 @@ function ytdlpDownload(url, useCookies = false) {
 
     const proc = spawn("yt-dlp", args, {
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     let stdout = "";
@@ -334,12 +356,29 @@ function ytdlpDownload(url, useCookies = false) {
       // Find the downloaded file
       try {
         const files = fs.readdirSync(tempDir).filter((f) => !f.startsWith("."));
-        if (files.length === 0) {
+
+        // Pick the largest file: yt-dlp may leave small leftovers (e.g. partial
+        // fragments) alongside the real output, and readdir order is unspecified.
+        let filepath = null;
+        let biggest = -1;
+        for (const f of files) {
+          const p = path.join(tempDir, f);
+          try {
+            const s = fs.statSync(p);
+            if (s.isFile() && s.size > biggest) {
+              biggest = s.size;
+              filepath = p;
+            }
+          } catch {
+            // ignore unreadable entries
+          }
+        }
+
+        if (!filepath) {
           cleanup(tempDir);
           return reject(new Error("yt-dlp produced no output"));
         }
 
-        const filepath = path.join(tempDir, files[0]);
         const stat = fs.statSync(filepath);
 
         if (stat.size === 0) {
@@ -403,26 +442,42 @@ function cleanup(dir) {
 //  Data extractors (JS API)
 // ──────────────────────────────────────────────
 
+/** The API returns some URL fields as either a string or an array of strings. */
+function firstUrl(value) {
+  if (Array.isArray(value)) return value.find(Boolean) || null;
+  return value || null;
+}
+
 function getVideoUrl(data, apiVersion) {
   const v = data?.video;
   if (!v) return null;
 
   if (apiVersion === "v2") {
-    const addrs = v.playAddr;
-    return Array.isArray(addrs) ? addrs[0] : addrs || null;
+    return firstUrl(v.playAddr);
   }
 
-  return v.noWaterMark || v.playAddr || v.play || v.downloadAddr || v.watermark || null;
+  return (
+    firstUrl(v.noWaterMark) ||
+    firstUrl(v.playAddr) ||
+    firstUrl(v.play) ||
+    firstUrl(v.downloadAddr) ||
+    firstUrl(v.watermark) ||
+    null
+  );
 }
 
 function getImageUrls(data) {
-  return data?.images || [];
+  const imgs = data?.images || [];
+  // Some schemas return [{ url: "..." }] instead of ["..."].
+  return imgs
+    .map((img) => (typeof img === "string" ? img : firstUrl(img?.url || img?.urls)))
+    .filter(Boolean);
 }
 
 function getAudioUrl(data) {
   const m = data?.music;
   if (!m) return null;
-  return m.playUrl || m.play_url || null;
+  return firstUrl(m.playUrl) || firstUrl(m.play_url) || null;
 }
 
 // ──────────────────────────────────────────────
@@ -432,6 +487,15 @@ function getAudioUrl(data) {
 /** Escape special characters for Telegram legacy Markdown mode */
 function escMd(text) {
   return String(text).replace(/[_*`[]/g, "\\$&");
+}
+
+/** Build a safe .mp4 filename so Telegram treats the document as a video. */
+function buildVideoFilename(data) {
+  const author = data.author || {};
+  const username = author.uniqueId || author.username || author.nickname || "tiktok";
+  const videoId = data.id || data.aweme_id || Date.now();
+  const base = `${username}_${videoId}`.replace(/[^\w.-]+/g, "_").slice(0, 100);
+  return `${base}.mp4`;
 }
 
 function buildCaption(data, type, apiVersion, method = "API") {
@@ -581,14 +645,17 @@ async function sendVideoStream(ctx, data, apiVersion, statusMsg) {
 
   await editStatus(ctx, statusMsg, "📺 Streaming video…");
 
-  const stream = await downloadLimiter.schedule(() => downloadStream(videoUrl));
+  const maxBytes = CONFIG.download.maxFileSizeMB * 1024 * 1024;
+  const stream = await downloadLimiter.schedule(() => downloadStream(videoUrl, maxBytes));
   const caption = buildCaption(data, "video", apiVersion, "API");
 
+  // Send as a document (uncompressed) — Telegram re-encodes playable videos.
+  const filename = buildVideoFilename(data);
+
   await withTelegramRetry(() =>
-    ctx.replyWithVideo(new InputFile(stream), {
+    ctx.replyWithDocument(new InputFile(stream, filename), {
       caption,
       parse_mode: "Markdown",
-      supports_streaming: true,
     })
   );
 
@@ -639,7 +706,8 @@ async function sendAudioStream(ctx, data, apiVersion, statusMsg) {
 
   await editStatus(ctx, statusMsg, "🎵 Streaming audio…");
 
-  const stream = await downloadLimiter.schedule(() => downloadStream(audioUrl));
+  const maxBytes = CONFIG.download.maxFileSizeMB * 1024 * 1024;
+  const stream = await downloadLimiter.schedule(() => downloadStream(audioUrl, maxBytes));
   const musicTitle = data.music?.title || data.music?.musicTitle || "TikTok Audio";
   const artist = data.music?.author || data.author?.nickname || "Unknown";
 
@@ -671,7 +739,7 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
 
   // Step 1: try without cookies
   try {
-    result = await ytdlpLimiter.schedule(() => ytdlpDownload(url, false));
+    result = await ytdlpLimiter.schedule(() => ytdlpDownload(url, false, mode));
   } catch (err1) {
     log("WARN", `yt-dlp (no cookies): ${err1.message}`);
 
@@ -679,7 +747,7 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
     if (hasCookiesFile) {
       try {
         await editStatus(ctx, statusMsg, "🍪 yt-dlp retry with cookies…");
-        result = await ytdlpLimiter.schedule(() => ytdlpDownload(url, true));
+        result = await ytdlpLimiter.schedule(() => ytdlpDownload(url, true, mode));
         usedCookies = true;
         metrics.cookieFallbacks++;
       } catch (err2) {
@@ -696,7 +764,10 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
     await editStatus(ctx, statusMsg, "📤 Uploading via yt-dlp…");
 
     const ext = path.extname(result.filepath).toLowerCase();
-    const isAudio = mode === "audio" || [".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus"].includes(ext);
+    // Decide by the actual file we got. In audio mode yt-dlp is asked for an
+    // audio-only stream; if only a video format exists we still send the video
+    // rather than mislabel an .mp4 as audio (which Telegram would reject).
+    const isAudio = [".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus"].includes(ext);
     const caption = buildYtdlpCaption(result.metadata, url);
 
     const fileStream = fs.createReadStream(result.filepath);
@@ -716,11 +787,11 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
       );
       metrics.audio++;
     } else {
+      // Send as a document (uncompressed) — Telegram re-encodes playable videos.
       await withTelegramRetry(() =>
-        ctx.replyWithVideo(new InputFile(fileStream, filename), {
+        ctx.replyWithDocument(new InputFile(fileStream, filename), {
           caption,
           parse_mode: "Markdown",
-          supports_streaming: true,
         })
       );
       metrics.videos++;
