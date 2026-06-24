@@ -727,15 +727,15 @@ async function sendAudioStream(ctx, data, apiVersion, statusMsg) {
 }
 
 // ──────────────────────────────────────────────
-//  Content sender (yt-dlp fallback)
+//  Content sender (yt-dlp — primary, max quality)
 // ──────────────────────────────────────────────
 
 async function sendViaYtdlp(ctx, url, mode, statusMsg) {
   if (!ytdlpAvailable) {
-    throw new Error("yt-dlp not installed — fallback unavailable");
+    throw new Error("yt-dlp not installed");
   }
 
-  await editStatus(ctx, statusMsg, "🔄 Fallback: downloading via yt-dlp…");
+  await editStatus(ctx, statusMsg, "⬇️ Mengunduh kualitas terbaik (yt-dlp)…");
 
   let result;
   let usedCookies = false;
@@ -811,10 +811,12 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
 // ──────────────────────────────────────────────
 //  Main processor — cascade logic
 //
-//  1. JS API (v1→v2) tanpa cookies
-//  2. JS API (v1→v2) dengan cookies (jika ada)
-//  3. yt-dlp tanpa cookies
-//  4. yt-dlp dengan cookies (jika ada)
+//  0. JS API metadata fetch (detects image vs video; also a fallback source)
+//  Images (slideshow):
+//    → JS API only (yt-dlp can't handle slideshows)
+//  Video / audio (quality-first):
+//    1. yt-dlp (best quality ≤50MB) without cookies → with cookies
+//    2. JS API stream (no-watermark) as fallback if yt-dlp fails
 // ──────────────────────────────────────────────
 
 async function processUrl(ctx, url, mode = "auto") {
@@ -838,39 +840,56 @@ async function processUrl(ctx, url, mode = "auto") {
       deletable = await canDeleteMessages(ctx);
     }
 
-    // ── Step 1: JS API ───────────────────────
-    let jsSuccess = false;
-    let jsErrorMsg = "";
+    // ── Step 0: JS API metadata ──────────────
+    // Detects image vs video and doubles as the fallback source if yt-dlp fails.
+    let apiData = null;
+    let apiVersion = null;
+    let apiErrorMsg = "";
 
     try {
-      await editStatus(ctx, statusMsg, "📡 Fetching via API…");
-      const { data, apiVersion } = await apiLimiter.schedule(() => fetchTikTokAPI(url));
-
-      log("INFO", `JS API OK via ${apiVersion}: type=${data.type || "unknown"}`);
-
-      const isImage = data.type === "image" || (data.images?.length > 0);
-
-      if (mode === "audio") {
-        await sendAudioStream(ctx, data, apiVersion, statusMsg);
-      } else if (isImage) {
-        await sendImages(ctx, data, apiVersion, statusMsg);
-      } else {
-        await sendVideoStream(ctx, data, apiVersion, statusMsg);
-      }
-
-      jsSuccess = true;
+      await editStatus(ctx, statusMsg, "📡 Mengambil info…");
+      const res = await apiLimiter.schedule(() => fetchTikTokAPI(url));
+      apiData = res.data;
+      apiVersion = res.apiVersion;
+      log("INFO", `JS API OK via ${apiVersion}: type=${apiData.type || "unknown"}`);
     } catch (jsErr) {
-      jsErrorMsg = jsErr.message;
-      log("WARN", `JS API failed for ${username}: ${jsErrorMsg}`);
-      // Continue to yt-dlp fallback
+      apiErrorMsg = jsErr.message;
+      log("WARN", `JS API metadata failed for ${username}: ${apiErrorMsg}`);
     }
 
-    // ── Step 2: yt-dlp fallback ──────────────
-    if (!jsSuccess) {
-      try {
-        await sendViaYtdlp(ctx, url, mode, statusMsg);
-      } catch (ytErr) {
-        throw new Error(`Semua metode gagal.\nAPI: ${jsErrorMsg}\nyt-dlp: ${ytErr.message}`);
+    const isImage = !!apiData && (apiData.type === "image" || apiData.images?.length > 0);
+
+    // ── Send ─────────────────────────────────
+    if (isImage && mode !== "audio") {
+      // Slideshows: only the JS API path handles these.
+      await sendImages(ctx, apiData, apiVersion, statusMsg);
+    } else {
+      // Video/audio: prefer yt-dlp for maximum quality, fall back to JS API stream.
+      let sent = false;
+      let ytErrorMsg = "";
+
+      if (ytdlpAvailable) {
+        try {
+          await sendViaYtdlp(ctx, url, mode, statusMsg);
+          sent = true;
+        } catch (ytErr) {
+          ytErrorMsg = ytErr.message;
+          log("WARN", `yt-dlp failed for ${username}: ${ytErrorMsg}`);
+        }
+      }
+
+      if (!sent) {
+        if (!apiData) {
+          throw new Error(
+            `Semua metode gagal.\nyt-dlp: ${ytErrorMsg || "tidak tersedia"}\nAPI: ${apiErrorMsg || "tidak ada data"}`
+          );
+        }
+        await editStatus(ctx, statusMsg, "📡 Fallback ke API…");
+        if (mode === "audio") {
+          await sendAudioStream(ctx, apiData, apiVersion, statusMsg);
+        } else {
+          await sendVideoStream(ctx, apiData, apiVersion, statusMsg);
+        }
       }
     }
 
@@ -930,8 +949,8 @@ function createBot() {
       "/reload\\_cookies — Muat ulang cookies\n",
       "⚡ *Fitur:*",
       "• Video, slideshow, audio",
-      "• Streaming tanpa disk (primary)",
-      "• yt-dlp fallback jika API gagal",
+      "• Video kualitas terbaik via yt-dlp (dikirim sebagai file)",
+      "• Fallback ke API jika yt-dlp gagal",
       "• Auto-retry dengan cookies",
       "• Auto-delete di grup",
     ].join("\n");
@@ -960,8 +979,8 @@ function createBot() {
       `🎥 Video: ${metrics.videos}`,
       `🖼️ Gambar: ${metrics.images}`,
       `🎵 Audio: ${metrics.audio}`,
-      `🔄 yt-dlp fallbacks: ${metrics.ytdlpFallbacks}`,
-      `🍪 Cookie fallbacks: ${metrics.cookieFallbacks}`,
+      `⬇️ yt-dlp downloads: ${metrics.ytdlpFallbacks}`,
+      `🍪 Cookie retries: ${metrics.cookieFallbacks}`,
       `⚡ Aktif: ${metrics.activeJobs}`,
       `🧠 Memory: ${mem} MB`,
       `🍪 Cookies: ${hasCookiesFile ? "✅" : "❌"}`,
