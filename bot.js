@@ -484,9 +484,14 @@ function getAudioUrl(data) {
 //  Caption builders
 // ──────────────────────────────────────────────
 
-/** Escape special characters for Telegram legacy Markdown mode */
-function escMd(text) {
-  return String(text).replace(/[_*`[]/g, "\\$&");
+/** Escape text for Telegram HTML parse mode. */
+function escHtml(text) {
+  return String(text).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+/** Escape a URL for use inside an HTML href="" attribute. */
+function escAttr(url) {
+  return escHtml(url).replace(/"/g, "&quot;");
 }
 
 /** Build a safe .mp4 filename so Telegram treats the document as a video. */
@@ -496,6 +501,28 @@ function buildVideoFilename(data) {
   const videoId = data.id || data.aweme_id || Date.now();
   const base = `${username}_${videoId}`.replace(/[^\w.-]+/g, "_").slice(0, 100);
   return `${base}.mp4`;
+}
+
+/**
+ * Build "<username>_<videoid>.<ext>" for a yt-dlp download from its metadata,
+ * keeping the real file extension. Falls back to yt-dlp's own filename when
+ * neither username nor id is available.
+ */
+function buildYtdlpFilename(metadata, filepath) {
+  const username = metadata?.uploader || metadata?.uploader_id || metadata?.creator || "";
+  const videoId = metadata?.id || metadata?.display_id || "";
+
+  if (!username && !videoId) {
+    return path.basename(filepath);
+  }
+
+  const ext = path.extname(filepath) || (metadata?.ext ? `.${metadata.ext}` : ".mp4");
+  const base = [username || "tiktok", videoId]
+    .filter(Boolean)
+    .join("_")
+    .replace(/[^\w.-]+/g, "_")
+    .slice(0, 100);
+  return `${base}${ext}`;
 }
 
 function buildCaption(data, type, apiVersion, method = "API") {
@@ -509,16 +536,16 @@ function buildCaption(data, type, apiVersion, method = "API") {
     (videoId ? `https://www.tiktok.com/@${username}/${type === "image" ? "photo" : "video"}/${videoId}` : `https://www.tiktok.com/@${username}`);
 
   const lines = [
-    `📅 ${formatTimestamp(data.createTime || data.create_time)}`,
-    `👤 [${escMd(username)}](${originalUrl}) (UID: ${escMd(uid)})`,
-    `🔧 ${escMd(method)} ${escMd(apiVersion.toUpperCase())}`,
-    `🔗 [Link TikTok](${originalUrl})`,
+    `📅 ${escHtml(formatTimestamp(data.createTime || data.create_time))}`,
+    `👤 <a href="${escAttr(originalUrl)}">${escHtml(username)}</a> (UID: ${escHtml(uid)})`,
+    `🔧 ${escHtml(method)} ${escHtml(String(apiVersion).toUpperCase())}`,
+    `🔗 <a href="${escAttr(originalUrl)}">Link TikTok</a>`,
   ];
 
   const desc = (data.desc || data.description || "").trim();
   if (desc) {
     const short = desc.length > 300 ? `${desc.slice(0, 300)}…` : desc;
-    lines.push("", `📝 "${escMd(short)}"`);
+    lines.push("", `📝 "${escHtml(short)}"`);
   }
 
   return lines.join("\n");
@@ -527,20 +554,19 @@ function buildCaption(data, type, apiVersion, method = "API") {
 function buildYtdlpCaption(metadata, url) {
   const title = metadata.title || metadata.fulltitle || "TikTok Video";
   const uploader = metadata.uploader || metadata.uploader_id || "Unknown";
-  const uploaderId = metadata.uploader_id || "";
   const duration = metadata.duration ? `${Math.round(metadata.duration)}s` : "–";
   const webpage = metadata.webpage_url || url;
 
   const lines = [
-    `👤 [${escMd(uploader)}](${webpage})`,
-    `🔧 yt-dlp fallback`,
-    `⏱️ ${escMd(duration)}`,
-    `🔗 [Link TikTok](${webpage})`,
+    `👤 <a href="${escAttr(webpage)}">${escHtml(uploader)}</a>`,
+    `🔧 yt-dlp`,
+    `⏱️ ${escHtml(duration)}`,
+    `🔗 <a href="${escAttr(webpage)}">Link TikTok</a>`,
   ];
 
   if (title && title !== "TikTok Video") {
     const short = title.length > 200 ? `${title.slice(0, 200)}…` : title;
-    lines.push("", `📝 "${escMd(short)}"`);
+    lines.push("", `📝 "${escHtml(short)}"`);
   }
 
   return lines.join("\n");
@@ -657,7 +683,7 @@ async function sendVideoStream(ctx, data, apiVersion, statusMsg) {
   await withTelegramRetry(() =>
     ctx.replyWithDocument(new InputFile(stream, filename), {
       caption,
-      parse_mode: "Markdown",
+      parse_mode: "HTML",
       disable_content_type_detection: true,
     })
   );
@@ -694,7 +720,7 @@ async function sendImages(ctx, data, apiVersion, statusMsg) {
     const mediaGroup = batch.map((stream, j) => ({
       type: "photo",
       media: new InputFile(stream),
-      ...(i === 0 && j === 0 ? { caption, parse_mode: "Markdown" } : {}),
+      ...(i === 0 && j === 0 ? { caption, parse_mode: "HTML" } : {}),
     }));
 
     await withTelegramRetry(() => ctx.replyWithMediaGroup(mediaGroup));
@@ -719,7 +745,7 @@ async function sendAudioStream(ctx, data, apiVersion, statusMsg) {
       title: musicTitle,
       performer: artist,
       caption: buildCaption(data, "audio", apiVersion, "API"),
-      parse_mode: "Markdown",
+      parse_mode: "HTML",
     })
   );
 
@@ -774,7 +800,7 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
     const caption = buildYtdlpCaption(result.metadata, url);
 
     const fileStream = fs.createReadStream(result.filepath);
-    const filename = path.basename(result.filepath);
+    const filename = buildYtdlpFilename(result.metadata, result.filepath);
 
     if (isAudio) {
       const title = result.metadata?.title || "TikTok Audio";
@@ -785,7 +811,7 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
           title,
           performer: artist,
           caption,
-          parse_mode: "Markdown",
+          parse_mode: "HTML",
         })
       );
       metrics.audio++;
@@ -796,7 +822,7 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
       await withTelegramRetry(() =>
         ctx.replyWithDocument(new InputFile(fileStream, filename), {
           caption,
-          parse_mode: "Markdown",
+          parse_mode: "HTML",
           disable_content_type_detection: true,
         })
       );
