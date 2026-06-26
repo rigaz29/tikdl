@@ -24,7 +24,7 @@ const CONFIG = {
 
   rateLimit: {
     window: 10_000,
-    maxRequests: 5,
+    maxRequests: 20,
   },
 
   api: {
@@ -36,7 +36,7 @@ const CONFIG = {
   download: {
     timeout: 30_000,
     maxRedirects: 10,
-    maxUrlsPerMessage: 3,
+    maxUrlsPerMessage: 20,
     maxFileSizeMB: 50,
   },
 
@@ -55,8 +55,8 @@ const CONFIG = {
     api: {
       minTime: 100,
       maxConcurrent: 10,
-      reservoir: 30,
-      reservoirRefreshAmount: 30,
+      reservoir: 100,
+      reservoirRefreshAmount: 100,
       reservoirRefreshInterval: 60_000,
     },
     download: {
