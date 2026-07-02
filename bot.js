@@ -9,7 +9,7 @@ const fs = require("fs");
 const path = require("path");
 const Bottleneck = require("bottleneck");
 const { PassThrough } = require("stream");
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 const os = require("os");
 
 // ──────────────────────────────────────────────
@@ -25,6 +25,9 @@ const CONFIG = {
   rateLimit: {
     window: 10_000,
     maxRequests: 20,
+    // Cap on queued+running jobs per user — the middleware limit counts
+    // messages, but one message can fan out into maxUrlsPerMessage jobs.
+    maxQueuedJobsPerUser: 40,
   },
 
   api: {
@@ -42,6 +45,7 @@ const CONFIG = {
 
   ytdlp: {
     timeout: 120_000,       // 2 minutes for yt-dlp
+    recheckIntervalMs: 10 * 60_000, // re-probe the binary so runtime (un)installs are noticed
     tempDir: process.env.YTDLP_TEMP_DIR || path.join(os.tmpdir(), "tiktok-bot"),
   },
 
@@ -91,13 +95,21 @@ const LOG_COLORS = {
   WARN: "\x1b[33m",
   ERROR: "\x1b[31m",
   OK: "\x1b[32m",
+  DEBUG: "\x1b[90m",
   RESET: "\x1b[0m",
 };
+
+const DEBUG_ENABLED = ["1", "true"].includes(String(process.env.LOG_DEBUG).toLowerCase());
 
 function log(level, message) {
   const ts = new Date().toISOString();
   const color = LOG_COLORS[level] || LOG_COLORS.RESET;
   console.log(`${color}[${ts}] [${level}] ${message}${LOG_COLORS.RESET}`);
+}
+
+/** For intentionally-swallowed errors, so they stay diagnosable. Enable with LOG_DEBUG=1. */
+function logDebug(message) {
+  if (DEBUG_ENABLED) log("DEBUG", message);
 }
 
 // ──────────────────────────────────────────────
@@ -151,6 +163,24 @@ const downloadLimiter = new Bottleneck(CONFIG.throttle.download);
 const processingLimiter = new Bottleneck(CONFIG.throttle.process);
 const ytdlpLimiter = new Bottleneck(CONFIG.throttle.ytdlp);
 
+// Per-user cap on queued+running jobs — without this, a user staying under
+// the message rate limit could still queue hundreds of jobs (20 msg/10s ×
+// maxUrlsPerMessage links each) and grow Bottleneck's queue unboundedly.
+const userJobCounts = new Map();
+
+function acquireUserJobs(userId, requested) {
+  const current = userJobCounts.get(userId) || 0;
+  const granted = Math.max(0, Math.min(requested, CONFIG.rateLimit.maxQueuedJobsPerUser - current));
+  if (granted > 0) userJobCounts.set(userId, current + granted);
+  return granted;
+}
+
+function releaseUserJob(userId) {
+  const current = userJobCounts.get(userId) || 0;
+  if (current <= 1) userJobCounts.delete(userId);
+  else userJobCounts.set(userId, current - 1);
+}
+
 // ──────────────────────────────────────────────
 //  HTTP helpers
 // ──────────────────────────────────────────────
@@ -200,6 +230,11 @@ async function downloadStream(url, maxBytes = 0) {
 
     const pass = new PassThrough();
     pass.on("error", (err) => log("WARN", `Stream error: ${err.message}`));
+    // If the consumer destroys the PassThrough (e.g. a failed upload), stop
+    // the underlying CDN download too instead of letting the socket linger.
+    pass.on("close", () => {
+      if (!resp.data.destroyed) resp.data.destroy();
+    });
     resp.data.on("error", (err) => pass.destroy(err));
     resp.data.pipe(pass);
     return pass;
@@ -225,8 +260,14 @@ async function downloadStream(url, maxBytes = 0) {
 const TIKTOK_URL_RE =
   /https?:\/\/(?:[\w-]+\.)?tiktok\.com\/\S+/gi;
 
+// Telegram caps message text at 4096 chars, but don't rely on that upstream
+// guarantee: bound the scanned length ourselves.
+const MAX_URL_SCAN_LENGTH = 8_192;
+
 function extractTikTokUrls(text) {
-  return (text.match(TIKTOK_URL_RE) || []).map((u) => u.replace(/[)\]}>]+$/, ""));
+  if (typeof text !== "string") return [];
+  const bounded = text.length > MAX_URL_SCAN_LENGTH ? text.slice(0, MAX_URL_SCAN_LENGTH) : text;
+  return (bounded.match(TIKTOK_URL_RE) || []).map((u) => u.replace(/[)\]}>]+$/, ""));
 }
 
 // ──────────────────────────────────────────────
@@ -276,19 +317,51 @@ async function fetchTikTokAPI(url) {
 // ──────────────────────────────────────────────
 
 /**
- * Check if yt-dlp is installed.
+ * yt-dlp availability — probed at startup, re-probed on an interval, and
+ * flipped off immediately on ENOENT so a runtime uninstall/install is noticed
+ * without restarting the bot.
  */
 let ytdlpAvailable = false;
+let ytdlpEverChecked = false;
+
+function setYtdlpStatus(available, version) {
+  if (available !== ytdlpAvailable || !ytdlpEverChecked) {
+    if (available) {
+      log("OK", `yt-dlp found: ${version || "unknown version"}`);
+    } else {
+      log("WARN", "yt-dlp not found — fallback disabled. Install: pip install yt-dlp");
+    }
+  }
+  ytdlpAvailable = available;
+  ytdlpEverChecked = true;
+}
 
 function checkYtdlp() {
-  try {
-    const ver = execSync("yt-dlp --version", { timeout: 5000 }).toString().trim();
-    ytdlpAvailable = true;
-    log("OK", `yt-dlp found: ${ver}`);
-  } catch {
-    ytdlpAvailable = false;
-    log("WARN", "yt-dlp not found — fallback disabled. Install: pip install yt-dlp");
-  }
+  // Async spawn instead of execSync: this also runs on an interval at runtime,
+  // where blocking the event loop for up to 5s is not acceptable.
+  return new Promise((resolve) => {
+    let settled = false;
+    let out = "";
+    const finish = (available, version) => {
+      if (settled) return;
+      settled = true;
+      setYtdlpStatus(available, version);
+      resolve(available);
+    };
+
+    const proc = spawn("yt-dlp", ["--version"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+    const timer = setTimeout(() => {
+      proc.kill("SIGKILL");
+      finish(false);
+    }, 5000);
+
+    proc.stdout.on("data", (d) => { out += d.toString(); });
+    proc.on("error", () => { clearTimeout(timer); finish(false); });
+    proc.on("close", (code) => { clearTimeout(timer); finish(code === 0, out.trim()); });
+  });
 }
 
 /**
@@ -300,6 +373,7 @@ function checkYtdlp() {
 function ytdlpDownload(url, useCookies = false, mode = "auto") {
   return new Promise((resolve, reject) => {
     const tempDir = fs.mkdtempSync(path.join(CONFIG.ytdlp.tempDir, "dl-"));
+    activeTempDirs.add(tempDir);
     const outputTpl = path.join(tempDir, "%(title).100B.%(ext)s");
     const maxSize = CONFIG.download.maxFileSizeMB;
 
@@ -349,7 +423,12 @@ function ytdlpDownload(url, useCookies = false, mode = "auto") {
 
       if (code !== 0) {
         cleanup(tempDir);
-        const errMsg = parseYtdlpError(stderr) || `yt-dlp exit code ${code}`;
+        // Fall back to the last stderr line so the user never sees just a
+        // bare exit code for failures parseYtdlpError doesn't recognize.
+        const tail = stderr.trim().split("\n").filter(Boolean).pop();
+        const errMsg =
+          parseYtdlpError(stderr) ||
+          (tail ? `yt-dlp: ${tail.trim().slice(0, 200)}` : `yt-dlp exit code ${code}`);
         return reject(new Error(errMsg));
       }
 
@@ -376,6 +455,11 @@ function ytdlpDownload(url, useCookies = false, mode = "auto") {
 
         if (!filepath) {
           cleanup(tempDir);
+          // --max-filesize makes yt-dlp skip the download but still exit 0,
+          // which would otherwise surface as an unhelpful "no output".
+          if (/larger than.*max-filesize/i.test(stdout + stderr)) {
+            return reject(new Error(`Video melebihi batas ${maxSize}MB`));
+          }
           return reject(new Error("yt-dlp produced no output"));
         }
 
@@ -397,8 +481,8 @@ function ytdlpDownload(url, useCookies = false, mode = "auto") {
           // yt-dlp --print-json outputs JSON per line
           const lines = stdout.trim().split("\n");
           metadata = JSON.parse(lines[lines.length - 1]);
-        } catch {
-          // Metadata parsing is optional
+        } catch (err) {
+          logDebug(`yt-dlp metadata parse failed: ${err.message}`);
         }
 
         resolve({ filepath, tempDir, metadata, fileSize: stat.size });
@@ -411,13 +495,20 @@ function ytdlpDownload(url, useCookies = false, mode = "auto") {
     proc.on("error", (err) => {
       clearTimeout(timer);
       cleanup(tempDir);
+      // Binary disappeared at runtime — stop advertising the yt-dlp path
+      // until the periodic re-check sees it again.
+      if (err.code === "ENOENT") setYtdlpStatus(false);
       reject(err);
     });
   });
 }
 
 function parseYtdlpError(stderr) {
-  const keywords = ["error:", "failed:", "unable to", "not found", "forbidden", "unavailable"];
+  const keywords = [
+    "error:", "failed:", "unable to", "not found", "not available", "forbidden",
+    "unavailable", "unsupported url", "sign in", "login required", "private",
+    "timed out", "http error",
+  ];
   const lines = stderr.split("\n").reverse();
   for (const line of lines) {
     const lower = line.toLowerCase();
@@ -430,11 +521,17 @@ function parseYtdlpError(stderr) {
   return null;
 }
 
+/** Temp dirs of jobs still downloading or uploading — the periodic sweep must skip these. */
+const activeTempDirs = new Set();
+
 function cleanup(dir) {
+  activeTempDirs.delete(dir);
   try {
-    fs.rmSync(dir, { recursive: true, force: true });
-  } catch {
-    // ignore
+    // maxRetries: on Windows rm can hit transient EBUSY/EPERM right after a
+    // file handle is closed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  } catch (err) {
+    logDebug(`cleanup(${dir}) failed: ${err.message}`);
   }
 }
 
@@ -494,13 +591,25 @@ function escAttr(url) {
   return escHtml(url).replace(/"/g, "&quot;");
 }
 
+/**
+ * Sanitize a filename base. The \w whitelist already removes slashes (so no
+ * path traversal is possible); edge dots are stripped so an all-junk title
+ * can't collapse into "..", ".mp4", or an empty name.
+ */
+function sanitizeFilenameBase(base) {
+  const cleaned = String(base)
+    .replace(/[^\w.-]+/g, "_")
+    .replace(/^[.\s]+|[.\s]+$/g, "")
+    .slice(0, 100);
+  return cleaned || "tiktok";
+}
+
 /** Build a safe .mp4 filename so Telegram treats the document as a video. */
 function buildVideoFilename(data) {
   const author = data.author || {};
   const username = author.uniqueId || author.username || author.nickname || "tiktok";
   const videoId = data.id || data.aweme_id || Date.now();
-  const base = `${username}_${videoId}`.replace(/[^\w.-]+/g, "_").slice(0, 100);
-  return `${base}.mp4`;
+  return `${sanitizeFilenameBase(`${username}_${videoId}`)}.mp4`;
 }
 
 /**
@@ -517,11 +626,7 @@ function buildYtdlpFilename(metadata, filepath) {
   }
 
   const ext = path.extname(filepath) || (metadata?.ext ? `.${metadata.ext}` : ".mp4");
-  const base = [username || "tiktok", videoId]
-    .filter(Boolean)
-    .join("_")
-    .replace(/[^\w.-]+/g, "_")
-    .slice(0, 100);
+  const base = sanitizeFilenameBase([username || "tiktok", videoId].filter(Boolean).join("_"));
   return `${base}${ext}`;
 }
 
@@ -605,18 +710,26 @@ function isGroup(ctx) {
   return t === "group" || t === "supergroup";
 }
 
+// chatId -> { value, expiresAt }. Timestamp expiry instead of setTimeout:
+// concurrent cache misses in one chat would stack timers whose earliest firing
+// cuts short the TTL of a freshly cached entry. Expired entries are dropped on
+// read; the periodic cleanup sweeps entries of chats that went quiet. The TTL
+// also bounds how long a stale answer survives an admin change mid-runtime.
 const deletePermCache = new Map();
+const DELETE_PERM_TTL_MS = 10 * 60_000;
 
 async function canDeleteMessages(ctx) {
   const chatId = ctx.chat.id;
-  if (deletePermCache.has(chatId)) return deletePermCache.get(chatId);
+  const cached = deletePermCache.get(chatId);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  deletePermCache.delete(chatId);
   try {
     const me = await ctx.api.getChatMember(chatId, ctx.me.id);
-    const result = me.status === "creator" || me.can_delete_messages === true;
-    deletePermCache.set(chatId, result);
-    setTimeout(() => deletePermCache.delete(chatId), 10 * 60_000); // 10 min TTL
-    return result;
-  } catch {
+    const value = me.status === "creator" || me.can_delete_messages === true;
+    deletePermCache.set(chatId, { value, expiresAt: Date.now() + DELETE_PERM_TTL_MS });
+    return value;
+  } catch (err) {
+    logDebug(`getChatMember(${chatId}) failed: ${err.message}`);
     return false;
   }
 }
@@ -624,39 +737,63 @@ async function canDeleteMessages(ctx) {
 async function tryDelete(ctx, messageId) {
   try {
     await ctx.api.deleteMessage(ctx.chat.id, messageId);
-  } catch {
-    // silent
+  } catch (err) {
+    logDebug(`deleteMessage(${messageId}) failed: ${err.message}`);
   }
 }
 
 async function editStatus(ctx, msg, text) {
   try {
     await ctx.api.editMessageText(msg.chat.id, msg.message_id, text);
-  } catch {
-    // silent
+  } catch (err) {
+    logDebug(`editMessageText failed: ${err.message}`);
   }
 }
 
 // ──────────────────────────────────────────────
-//  Telegram send helper with 429 retry
+//  Telegram send helper with retry (429 + transient network errors)
 // ──────────────────────────────────────────────
 
-async function withTelegramRetry(fn, maxRetries = 3) {
+const TRANSIENT_NET_CODES = new Set([
+  "ECONNRESET", "ECONNABORTED", "ECONNREFUSED", "ETIMEDOUT", "EPIPE",
+  "EAI_AGAIN", "ENETUNREACH", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
+]);
+
+function isTransientTelegramError(err) {
+  // grammY wraps all network-level failures (timeouts, resets) in HttpError.
+  if (err instanceof HttpError) return true;
+  // Telegram-side transient failures: flood limit and 5xx gateway hiccups.
+  // Other GrammyErrors (400 bad request, etc.) are permanent — never retry.
+  if (err instanceof GrammyError) {
+    return err.error_code === 429 || err.error_code >= 500;
+  }
+  const code = err?.code || err?.cause?.code;
+  if (code && TRANSIENT_NET_CODES.has(code)) return true;
+  return /socket hang up|fetch failed|network|terminated/i.test(err?.message || "");
+}
+
+/**
+ * Retry a Telegram send. `makeAttempt` runs once per attempt and MUST create
+ * any streams it uploads inside itself — a stream consumed by a failed
+ * attempt cannot be replayed, so reusing one would send an empty/corrupt file.
+ */
+async function withTelegramRetry(makeAttempt, maxRetries = 3) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await fn();
+      return await makeAttempt();
     } catch (err) {
+      if (attempt >= maxRetries || !isTransientTelegramError(err)) throw err;
+
+      let waitMs;
       if (err instanceof GrammyError && err.error_code === 429) {
-        const waitMs = ((err.parameters?.retry_after ?? 5) + 1) * 1000;
+        waitMs = ((err.parameters?.retry_after ?? 5) + 1) * 1000;
         log("WARN", `Telegram flood limit (429), retry in ${waitMs}ms (attempt ${attempt}/${maxRetries})`);
-        if (attempt < maxRetries) {
-          await sleep(waitMs);
-        } else {
-          throw err;
-        }
       } else {
-        throw err;
+        waitMs = 1000 * 2 ** (attempt - 1);
+        log("WARN", `Transient send error: ${err.message} — retry in ${waitMs}ms (attempt ${attempt}/${maxRetries})`);
       }
+      await sleep(waitMs);
     }
   }
 }
@@ -672,21 +809,27 @@ async function sendVideoStream(ctx, data, apiVersion, statusMsg) {
   await editStatus(ctx, statusMsg, "📺 Streaming video…");
 
   const maxBytes = CONFIG.download.maxFileSizeMB * 1024 * 1024;
-  const stream = await downloadLimiter.schedule(() => downloadStream(videoUrl, maxBytes));
   const caption = buildCaption(data, "video", apiVersion, "API");
-
-  // Send as a document (uncompressed) — Telegram re-encodes playable videos.
-  // disable_content_type_detection keeps it a plain file instead of letting
-  // Telegram auto-render the .mp4 as an inline playable video.
   const filename = buildVideoFilename(data);
 
-  await withTelegramRetry(() =>
-    ctx.replyWithDocument(new InputFile(stream, filename), {
-      caption,
-      parse_mode: "HTML",
-      disable_content_type_detection: true,
-    })
-  );
+  // Download inside the retry attempt: a consumed stream can't be replayed,
+  // so each retry needs a fresh one.
+  await withTelegramRetry(async () => {
+    const stream = await downloadLimiter.schedule(() => downloadStream(videoUrl, maxBytes));
+    try {
+      // Send as a document (uncompressed) — Telegram re-encodes playable videos.
+      // disable_content_type_detection keeps it a plain file instead of letting
+      // Telegram auto-render the .mp4 as an inline playable video.
+      return await ctx.replyWithDocument(new InputFile(stream, filename), {
+        caption,
+        parse_mode: "HTML",
+        disable_content_type_detection: true,
+      });
+    } catch (err) {
+      stream.destroy(); // release the CDN socket if the upload failed midway
+      throw err;
+    }
+  });
 
   metrics.videos++;
 }
@@ -697,36 +840,62 @@ async function sendImages(ctx, data, apiVersion, statusMsg) {
 
   await editStatus(ctx, statusMsg, `🖼️ Streaming ${urls.length} gambar…`);
 
-  const results = await Promise.allSettled(
-    urls.map((url) => downloadLimiter.schedule(() => downloadStream(url)))
-  );
-
-  const streams = results
-    .filter((r) => r.status === "fulfilled")
-    .map((r) => r.value);
-
-  if (streams.length === 0) throw new Error("Failed to download all images");
-
-  if (streams.length < urls.length) {
-    await ctx.reply(`⚠️ ${urls.length - streams.length} dari ${urls.length} gambar gagal diunduh.`);
-  }
-
   const caption = buildCaption(data, "image", apiVersion, "API");
 
   const BATCH_SIZE = 10;
-  for (let i = 0; i < streams.length; i += BATCH_SIZE) {
-    const batch = streams.slice(i, i + BATCH_SIZE);
+  let sentCount = 0;
+  let failedCount = 0;
+  let captionPending = true;
 
-    const mediaGroup = batch.map((stream, j) => ({
-      type: "photo",
-      media: new InputFile(stream),
-      ...(i === 0 && j === 0 ? { caption, parse_mode: "HTML" } : {}),
-    }));
+  for (let i = 0; i < urls.length; i += BATCH_SIZE) {
+    const batchUrls = urls.slice(i, i + BATCH_SIZE);
+    const wantCaption = captionPending;
 
-    await withTelegramRetry(() => ctx.replyWithMediaGroup(mediaGroup));
+    // Download inside the retry attempt: a consumed stream can't be replayed,
+    // so each retry needs fresh ones. On a failed send every stream of the
+    // batch is destroyed so the CDN sockets don't linger.
+    const batchResult = await withTelegramRetry(async () => {
+      const settled = await Promise.allSettled(
+        batchUrls.map((url) => downloadLimiter.schedule(() => downloadStream(url)))
+      );
+      const streams = settled
+        .filter((r) => r.status === "fulfilled")
+        .map((r) => r.value);
+
+      if (streams.length === 0) {
+        return { sent: 0, failed: batchUrls.length };
+      }
+
+      const mediaGroup = streams.map((stream, j) => ({
+        type: "photo",
+        media: new InputFile(stream),
+        ...(wantCaption && j === 0 ? { caption, parse_mode: "HTML" } : {}),
+      }));
+
+      try {
+        await ctx.replyWithMediaGroup(mediaGroup);
+      } catch (err) {
+        for (const s of streams) s.destroy();
+        throw err;
+      }
+
+      return { sent: streams.length, failed: batchUrls.length - streams.length };
+    });
+
+    if (batchResult.sent > 0) captionPending = false;
+    sentCount += batchResult.sent;
+    failedCount += batchResult.failed;
   }
 
-  metrics.images += streams.length;
+  if (sentCount === 0) throw new Error("Failed to download all images");
+
+  if (failedCount > 0) {
+    await ctx
+      .reply(`⚠️ ${failedCount} dari ${urls.length} gambar gagal diunduh.`)
+      .catch(() => {});
+  }
+
+  metrics.images += sentCount;
 }
 
 async function sendAudioStream(ctx, data, apiVersion, statusMsg) {
@@ -736,18 +905,25 @@ async function sendAudioStream(ctx, data, apiVersion, statusMsg) {
   await editStatus(ctx, statusMsg, "🎵 Streaming audio…");
 
   const maxBytes = CONFIG.download.maxFileSizeMB * 1024 * 1024;
-  const stream = await downloadLimiter.schedule(() => downloadStream(audioUrl, maxBytes));
   const musicTitle = data.music?.title || data.music?.musicTitle || "TikTok Audio";
   const artist = data.music?.author || data.author?.nickname || "Unknown";
+  const caption = buildCaption(data, "audio", apiVersion, "API");
 
-  await withTelegramRetry(() =>
-    ctx.replyWithAudio(new InputFile(stream), {
-      title: musicTitle,
-      performer: artist,
-      caption: buildCaption(data, "audio", apiVersion, "API"),
-      parse_mode: "HTML",
-    })
-  );
+  // Download inside the retry attempt: a consumed stream can't be replayed.
+  await withTelegramRetry(async () => {
+    const stream = await downloadLimiter.schedule(() => downloadStream(audioUrl, maxBytes));
+    try {
+      return await ctx.replyWithAudio(new InputFile(stream), {
+        title: musicTitle,
+        performer: artist,
+        caption,
+        parse_mode: "HTML",
+      });
+    } catch (err) {
+      stream.destroy(); // release the CDN socket if the upload failed midway
+      throw err;
+    }
+  });
 
   metrics.audio++;
 }
@@ -798,21 +974,34 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
     // rather than mislabel an .mp4 as audio (which Telegram would reject).
     const isAudio = [".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus"].includes(ext);
     const caption = buildYtdlpCaption(result.metadata, url);
-
-    const fileStream = fs.createReadStream(result.filepath);
     const filename = buildYtdlpFilename(result.metadata, result.filepath);
+
+    // Open the file inside each retry attempt: a consumed stream can't be
+    // replayed, and a leftover open fd would make the rm in cleanup() fail
+    // on Windows and orphan the temp dir.
+    const sendFile = async (send) => {
+      const fileStream = fs.createReadStream(result.filepath);
+      try {
+        return await send(fileStream);
+      } catch (err) {
+        fileStream.destroy();
+        throw err;
+      }
+    };
 
     if (isAudio) {
       const title = result.metadata?.title || "TikTok Audio";
       const artist = result.metadata?.uploader || "Unknown";
 
       await withTelegramRetry(() =>
-        ctx.replyWithAudio(new InputFile(fileStream, filename), {
-          title,
-          performer: artist,
-          caption,
-          parse_mode: "HTML",
-        })
+        sendFile((fileStream) =>
+          ctx.replyWithAudio(new InputFile(fileStream, filename), {
+            title,
+            performer: artist,
+            caption,
+            parse_mode: "HTML",
+          })
+        )
       );
       metrics.audio++;
     } else {
@@ -820,11 +1009,13 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
       // disable_content_type_detection keeps it a plain file instead of an
       // inline playable video.
       await withTelegramRetry(() =>
-        ctx.replyWithDocument(new InputFile(fileStream, filename), {
-          caption,
-          parse_mode: "HTML",
-          disable_content_type_detection: true,
-        })
+        sendFile((fileStream) =>
+          ctx.replyWithDocument(new InputFile(fileStream, filename), {
+            caption,
+            parse_mode: "HTML",
+            disable_content_type_detection: true,
+          })
+        )
       );
       metrics.videos++;
     }
@@ -1024,7 +1215,14 @@ function createBot() {
       return ctx.reply("🎵 Kirim: /audio <link TikTok>");
     }
 
-    await processingLimiter.schedule(() => processUrl(ctx, urls[0], "audio"));
+    const userKey = String(ctx.from?.id ?? "anon");
+    if (acquireUserJobs(userKey, 1) === 0) {
+      return ctx.reply("⏰ Antrean kamu masih penuh — tunggu beberapa unduhan selesai dulu.").catch(() => {});
+    }
+
+    await processingLimiter
+      .schedule(() => processUrl(ctx, urls[0], "audio"))
+      .finally(() => releaseUserJob(userKey));
   });
 
   bot.command("reload_cookies", (ctx) => {
@@ -1038,15 +1236,36 @@ function createBot() {
     const urls = extractTikTokUrls(ctx.message.text);
     if (urls.length === 0) return;
 
-    const batch = urls.slice(0, CONFIG.download.maxUrlsPerMessage);
+    let batch = urls.slice(0, CONFIG.download.maxUrlsPerMessage);
 
     if (urls.length > CONFIG.download.maxUrlsPerMessage) {
-      await ctx.reply(
-        `⚠️ Maksimal ${CONFIG.download.maxUrlsPerMessage} link per pesan. Memproses ${CONFIG.download.maxUrlsPerMessage} pertama.`
-      );
+      await ctx
+        .reply(
+          `⚠️ Maksimal ${CONFIG.download.maxUrlsPerMessage} link per pesan. Memproses ${CONFIG.download.maxUrlsPerMessage} pertama.`
+        )
+        .catch(() => {});
     }
 
-    await Promise.allSettled(batch.map((url) => processingLimiter.schedule(() => processUrl(ctx, url))));
+    const userKey = String(ctx.from?.id ?? "anon");
+    const granted = acquireUserJobs(userKey, batch.length);
+
+    if (granted === 0) {
+      return ctx.reply("⏰ Antrean kamu masih penuh — tunggu beberapa unduhan selesai dulu.").catch(() => {});
+    }
+    if (granted < batch.length) {
+      await ctx
+        .reply(`⚠️ Antrean hampir penuh: hanya ${granted} dari ${batch.length} link yang diproses.`)
+        .catch(() => {});
+      batch = batch.slice(0, granted);
+    }
+
+    await Promise.allSettled(
+      batch.map((url) =>
+        processingLimiter
+          .schedule(() => processUrl(ctx, url))
+          .finally(() => releaseUserJob(userKey))
+      )
+    );
   });
 
   // ── Error boundary ───────────────────────
@@ -1072,6 +1291,13 @@ function createBot() {
 
 function startCleanupInterval() {
   setInterval(() => {
+    // Sweep expired delete-permission cache entries of chats that went quiet
+    // (active chats already drop theirs lazily on read).
+    const now = Date.now();
+    for (const [chatId, entry] of deletePermCache) {
+      if (entry.expiresAt <= now) deletePermCache.delete(chatId);
+    }
+
     try {
       const tempBase = CONFIG.ytdlp.tempDir;
       if (!fs.existsSync(tempBase)) return;
@@ -1082,14 +1308,17 @@ function startCleanupInterval() {
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
         const fullPath = path.join(tempBase, entry.name);
+        // Never sweep a dir a running job still uses — mtime alone can't tell,
+        // since the upload to Telegram can outlive the 1h cutoff.
+        if (activeTempDirs.has(fullPath)) continue;
         try {
           const stat = fs.statSync(fullPath);
           if (stat.mtimeMs < cutoff) {
-            fs.rmSync(fullPath, { recursive: true, force: true });
+            fs.rmSync(fullPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
             log("INFO", `Cleaned up stale temp dir: ${entry.name}`);
           }
-        } catch {
-          // ignore
+        } catch (err) {
+          logDebug(`Cleanup skipped ${entry.name}: ${err.message}`);
         }
       }
     } catch (err) {
@@ -1107,7 +1336,7 @@ async function main() {
   fs.mkdirSync(CONFIG.ytdlp.tempDir, { recursive: true });
 
   loadCookies();
-  checkYtdlp();
+  await checkYtdlp();
 
   const bot = createBot();
 
@@ -1137,18 +1366,44 @@ async function main() {
     },
   });
 
+  // When getUpdates keeps failing past maxRetryTime the runner stops silently
+  // and the process would stay alive but deaf. Exit non-zero instead so a
+  // supervisor (pm2/systemd/NSSM) can restart the bot.
+  let shuttingDown = false;
+  runner.task()?.then(
+    () => {
+      if (!shuttingDown) {
+        log("ERROR", "Update polling stopped unexpectedly (maxRetryTime exceeded?) — exiting");
+        process.exit(1);
+      }
+    },
+    (err) => {
+      log("ERROR", `Update polling crashed: ${err?.message || err} — exiting`);
+      process.exit(1);
+    }
+  );
+
   startCleanupInterval();
+
+  // Re-probe yt-dlp so an uninstall/install during runtime is picked up.
+  setInterval(() => { checkYtdlp(); }, CONFIG.ytdlp.recheckIntervalMs);
 
   log("OK", "Bot is running! Press Ctrl+C to stop.");
   log("INFO", `Cookies: ${hasCookiesFile ? "✅" : "❌"}  |  yt-dlp: ${ytdlpAvailable ? "✅" : "❌"}`);
 
   const shutdown = () => {
+    shuttingDown = true;
     log("WARN", "Shutting down…");
     if (runner.isRunning()) runner.stop();
 
-    // Cleanup temp dir
+    // Only remove our own dl-* dirs: YTDLP_TEMP_DIR may point at a directory
+    // shared with other software.
     try {
-      fs.rmSync(CONFIG.ytdlp.tempDir, { recursive: true, force: true });
+      for (const entry of fs.readdirSync(CONFIG.ytdlp.tempDir, { withFileTypes: true })) {
+        if (entry.isDirectory() && entry.name.startsWith("dl-")) {
+          fs.rmSync(path.join(CONFIG.ytdlp.tempDir, entry.name), { recursive: true, force: true });
+        }
+      }
     } catch {
       // ignore
     }
@@ -1165,11 +1420,11 @@ function sleep(ms) {
 }
 
 process.on("uncaughtException", (err) => {
-  log("ERROR", `Uncaught: ${err.message}`);
+  log("ERROR", `Uncaught: ${err?.stack || err?.message || err}`);
 });
 
 process.on("unhandledRejection", (err) => {
-  log("ERROR", `Unhandled rejection: ${err?.message || err}`);
+  log("ERROR", `Unhandled rejection: ${err?.stack || err?.message || err}`);
 });
 
 main().catch((err) => {
