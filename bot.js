@@ -973,6 +973,15 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
     // audio-only stream; if only a video format exists we still send the video
     // rather than mislabel an .mp4 as audio (which Telegram would reject).
     const isAudio = [".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus"].includes(ext);
+
+    // The reverse mislabel: in video/auto mode an audio-only file means
+    // yt-dlp couldn't get actual video — TikTok slideshow posts, for one,
+    // download as just their soundtrack. Throw so the cascade falls back to
+    // the JS API instead of replying with the wrong content type.
+    if (isAudio && mode !== "audio") {
+      throw new Error("yt-dlp returned audio-only output for a video request");
+    }
+
     const caption = buildYtdlpCaption(result.metadata, url);
     const filename = buildYtdlpFilename(result.metadata, result.filepath);
 
@@ -1033,7 +1042,9 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
 //    → JS API only (yt-dlp can't handle slideshows)
 //  Video / audio (quality-first):
 //    1. yt-dlp (best quality ≤50MB) without cookies → with cookies
-//    2. JS API stream (no-watermark) as fallback if yt-dlp fails
+//    2. JS API stream (no-watermark) as fallback if yt-dlp fails or returns
+//       an audio-only file for a video request (e.g. slideshow soundtrack);
+//       re-fetches metadata if step 0 failed and re-detects slideshows
 // ──────────────────────────────────────────────
 
 async function processUrl(ctx, url, mode = "auto") {
@@ -1096,14 +1107,35 @@ async function processUrl(ctx, url, mode = "auto") {
       }
 
       if (!sent) {
+        // Step 0 may have failed transiently and yt-dlp ran for up to two
+        // minutes since — the API is the last remaining source, so give the
+        // metadata fetch (v1 → v2) one more chance before giving up.
+        if (!apiData) {
+          try {
+            await editStatus(ctx, statusMsg, "📡 Fallback ke API…");
+            const res = await apiLimiter.schedule(() => fetchTikTokAPI(url));
+            apiData = res.data;
+            apiVersion = res.apiVersion;
+            log("INFO", `JS API retry OK via ${apiVersion}: type=${apiData.type || "unknown"}`);
+          } catch (jsErr) {
+            apiErrorMsg = jsErr.message;
+          }
+        }
+
         if (!apiData) {
           throw new Error(
             `Semua metode gagal.\nyt-dlp: ${ytErrorMsg || "tidak tersedia"}\nAPI: ${apiErrorMsg || "tidak ada data"}`
           );
         }
+
         await editStatus(ctx, statusMsg, "📡 Fallback ke API…");
         if (mode === "audio") {
           await sendAudioStream(ctx, apiData, apiVersion, statusMsg);
+        } else if (apiData.type === "image" || apiData.images?.length > 0) {
+          // A slideshow step 0 couldn't identify (its metadata fetch failed
+          // back then): yt-dlp only grabs the soundtrack for these — which is
+          // why it was rejected above — so send the actual images.
+          await sendImages(ctx, apiData, apiVersion, statusMsg);
         } else {
           await sendVideoStream(ctx, apiData, apiVersion, statusMsg);
         }
