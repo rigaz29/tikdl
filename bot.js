@@ -267,7 +267,13 @@ const MAX_URL_SCAN_LENGTH = 8_192;
 function extractTikTokUrls(text) {
   if (typeof text !== "string") return [];
   const bounded = text.length > MAX_URL_SCAN_LENGTH ? text.slice(0, MAX_URL_SCAN_LENGTH) : text;
-  return (bounded.match(TIKTOK_URL_RE) || []).map((u) => u.replace(/[)\]}>]+$/, ""));
+  // Strip trailing punctuation the \S+ match drags along ("link." / "link,"):
+  // canonical TikTok URLs never end in these. Dedupe so a URL pasted twice in
+  // one message isn't downloaded and sent twice.
+  const urls = (bounded.match(TIKTOK_URL_RE) || []).map((u) =>
+    u.replace(/[)\]}>.,;:!?'"]+$/, "")
+  );
+  return [...new Set(urls)];
 }
 
 // ──────────────────────────────────────────────
@@ -372,6 +378,10 @@ function checkYtdlp() {
  */
 function ytdlpDownload(url, useCookies = false, mode = "auto") {
   return new Promise((resolve, reject) => {
+    // Re-create the base dir each time: OS tmp cleaners (systemd-tmpfiles,
+    // tmpwatch) can remove it while the bot runs, which would otherwise make
+    // every mkdtemp fail with ENOENT until restart.
+    fs.mkdirSync(CONFIG.ytdlp.tempDir, { recursive: true });
     const tempDir = fs.mkdtempSync(path.join(CONFIG.ytdlp.tempDir, "dl-"));
     activeTempDirs.add(tempDir);
     const outputTpl = path.join(tempDir, "%(title).100B.%(ext)s");
@@ -547,11 +557,13 @@ function firstUrl(value) {
 
 function getVideoUrl(data, apiVersion) {
   const v = data?.video;
-  if (!v) return null;
 
   if (apiVersion === "v2") {
-    return firstUrl(v.playAddr);
+    // SSSTik sometimes returns only a top-level `direct` URL without video.playAddr.
+    return firstUrl(v?.playAddr) || firstUrl(data?.direct);
   }
+
+  if (!v) return null;
 
   return (
     firstUrl(v.noWaterMark) ||
@@ -866,14 +878,23 @@ async function sendImages(ctx, data, apiVersion, statusMsg) {
         return { sent: 0, failed: batchUrls.length };
       }
 
-      const mediaGroup = streams.map((stream, j) => ({
-        type: "photo",
-        media: new InputFile(stream),
-        ...(wantCaption && j === 0 ? { caption, parse_mode: "HTML" } : {}),
-      }));
-
       try {
-        await ctx.replyWithMediaGroup(mediaGroup);
+        if (streams.length === 1) {
+          // Telegram requires 2–10 items per media group — a lone leftover
+          // (e.g. image 11 of an 11-image slideshow, or a batch where only
+          // one download succeeded) must go as a single photo instead.
+          await ctx.replyWithPhoto(
+            new InputFile(streams[0]),
+            wantCaption ? { caption, parse_mode: "HTML" } : {}
+          );
+        } else {
+          const mediaGroup = streams.map((stream, j) => ({
+            type: "photo",
+            media: new InputFile(stream),
+            ...(wantCaption && j === 0 ? { caption, parse_mode: "HTML" } : {}),
+          }));
+          await ctx.replyWithMediaGroup(mediaGroup);
+        }
       } catch (err) {
         for (const s of streams) s.destroy();
         throw err;
@@ -948,8 +969,12 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
   } catch (err1) {
     log("WARN", `yt-dlp (no cookies): ${err1.message}`);
 
+    // A size-cap failure is not an auth problem — cookies won't shrink the
+    // video, so a retry would only burn up to another 2-minute timeout.
+    const isSizeError = /melebihi batas|too large|max-filesize/i.test(err1.message);
+
     // Step 2: try with cookies
-    if (hasCookiesFile) {
+    if (hasCookiesFile && !isSizeError) {
       try {
         await editStatus(ctx, statusMsg, "🍪 yt-dlp retry with cookies…");
         result = await ytdlpLimiter.schedule(() => ytdlpDownload(url, true, mode));
