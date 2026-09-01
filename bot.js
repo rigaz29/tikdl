@@ -55,23 +55,31 @@ const CONFIG = {
     groupsOnly: true,
   },
 
+  // Concurrency is deliberately narrow. TikTok's WAF rate-limits by IP, and a
+  // burst does not just fail its own requests: measured with 10 links, yt-dlp
+  // at maxConcurrent 3 failed 10/10 and left the IP challenged for ~4 minutes,
+  // so downloads queued after the burst failed too. Serial was also *faster*
+  // end to end (44s vs 66s for 10 links), because the upstream API serializes
+  // anyway. Raising these trades reliability for throughput that isn't there.
   throttle: {
     api: {
       minTime: 100,
-      maxConcurrent: 10,
+      maxConcurrent: 3,
       reservoir: 100,
       reservoirRefreshAmount: 100,
       reservoirRefreshInterval: 60_000,
     },
     download: {
-      maxConcurrent: 15,
+      maxConcurrent: 4,
       minTime: 50,
     },
     process: {
-      maxConcurrent: 20,
+      maxConcurrent: 3,
     },
     ytdlp: {
-      maxConcurrent: 3,
+      // One at a time, spaced out: this is the path that trips the WAF.
+      maxConcurrent: 1,
+      minTime: 2_500,
     },
   },
 };
