@@ -47,6 +47,18 @@ const CONFIG = {
     timeout: 120_000,       // 2 minutes for yt-dlp
     recheckIntervalMs: 10 * 60_000, // re-probe the binary so runtime (un)installs are noticed
     tempDir: process.env.YTDLP_TEMP_DIR || path.join(os.tmpdir(), "tiktok-bot"),
+
+    // Circuit breaker for a hard block ("Your IP address is blocked from
+    // accessing this post"), where every yt-dlp spawn is wasted work before the
+    // JS API fallback runs anyway — the API uses different endpoints and keeps
+    // working. This is insurance, not a hot path: routine extraction failures
+    // are TikTok's intermittent JS challenge at roughly 15%, independent per
+    // request, so the threshold is set high enough that normal flakiness
+    // (0.15^5, about 1 in 13,000) will not trip it.
+    breaker: {
+      failureThreshold: 5,  // consecutive block-shaped failures before opening
+      openMs: 5 * 60_000,   // how long to bypass yt-dlp before probing again
+    },
   },
 
   autoDelete: {
@@ -55,31 +67,28 @@ const CONFIG = {
     groupsOnly: true,
   },
 
-  // Concurrency is deliberately narrow. TikTok's WAF rate-limits by IP, and a
-  // burst does not just fail its own requests: measured with 10 links, yt-dlp
-  // at maxConcurrent 3 failed 10/10 and left the IP challenged for ~4 minutes,
-  // so downloads queued after the burst failed too. Serial was also *faster*
-  // end to end (44s vs 66s for 10 links), because the upstream API serializes
-  // anyway. Raising these trades reliability for throughput that isn't there.
+  // Measured with 10 links, two rounds each: yt-dlp at maxConcurrent 3 scored
+  // 17/20 in ~12s, while serialising it with 2.5s spacing scored 16/20 in ~52s.
+  // Extraction failures here are TikTok's intermittent JS challenge (~15%) and
+  // do not get worse with this much concurrency, so narrowing these widths only
+  // costs wall-clock time. Re-measure before changing them.
   throttle: {
     api: {
       minTime: 100,
-      maxConcurrent: 3,
+      maxConcurrent: 10,
       reservoir: 100,
       reservoirRefreshAmount: 100,
       reservoirRefreshInterval: 60_000,
     },
     download: {
-      maxConcurrent: 4,
+      maxConcurrent: 15,
       minTime: 50,
     },
     process: {
-      maxConcurrent: 3,
+      maxConcurrent: 20,
     },
     ytdlp: {
-      // One at a time, spaced out: this is the path that trips the WAF.
-      maxConcurrent: 1,
-      minTime: 2_500,
+      maxConcurrent: 3,
     },
   },
 };
@@ -158,6 +167,7 @@ const metrics = {
   audio: 0,
   ytdlpFallbacks: 0,
   cookieFallbacks: 0,
+  breakerTrips: 0,
   activeJobs: 0,
   startedAt: Date.now(),
 };
@@ -542,6 +552,93 @@ function parseYtdlpError(stderr) {
   if (stderr.toLowerCase().includes("private video")) return "Video is private";
   if (stderr.includes("404")) return "Video not found (404)";
   return null;
+}
+
+// ── yt-dlp circuit breaker ────────────────────
+//
+// closed → (failureThreshold consecutive block errors) → open
+// open   → (openMs elapsed) → one probe download
+// probe  → success closes it; failure re-opens for another openMs
+
+const ytdlpBreaker = {
+  consecutiveFailures: 0,
+  openedAt: 0,      // 0 when closed
+  probing: false,   // a post-cooldown probe download is in flight
+};
+
+/**
+ * Does this failure look like TikTok blocking us, rather than something about
+ * the requested post? Only the former should trip the breaker — a private
+ * video or an oversized file says nothing about whether the next one will work.
+ */
+function isYtdlpBlockError(message) {
+  return /unexpected response from webpage|universal data for rehydration|ip address is blocked|unable to extract|timed out|timeout|too many requests|forbidden|http error 4\d\d/i.test(
+    String(message)
+  );
+}
+
+/** True when yt-dlp should be skipped entirely for this download. */
+function ytdlpBreakerOpen() {
+  if (!ytdlpBreaker.openedAt) return false;
+
+  if (Date.now() - ytdlpBreaker.openedAt < CONFIG.ytdlp.breaker.openMs) return true;
+
+  // Cooldown elapsed. Let exactly one download through to test the water —
+  // everything else keeps using the API until that probe reports back, so a
+  // still-blocked IP gets one request instead of a fresh burst.
+  if (ytdlpBreaker.probing) return true;
+  ytdlpBreaker.probing = true;
+  log("INFO", "yt-dlp breaker: cooldown elapsed, probing with one download");
+  return false;
+}
+
+function recordYtdlpSuccess() {
+  if (ytdlpBreaker.openedAt || ytdlpBreaker.consecutiveFailures > 0) {
+    log("OK", "yt-dlp breaker: closed after a successful download");
+  }
+  ytdlpBreaker.consecutiveFailures = 0;
+  ytdlpBreaker.openedAt = 0;
+  ytdlpBreaker.probing = false;
+}
+
+function recordYtdlpFailure(message) {
+  if (!isYtdlpBlockError(message)) return;
+
+  const openMins = Math.round(CONFIG.ytdlp.breaker.openMs / 60_000);
+
+  if (ytdlpBreaker.probing) {
+    // Still blocked — wait another full round rather than re-counting to the
+    // threshold, which would let three more subprocesses through first.
+    ytdlpBreaker.probing = false;
+    ytdlpBreaker.openedAt = Date.now();
+    log("WARN", `yt-dlp breaker: probe failed, staying open ${openMins} min`);
+    return;
+  }
+
+  ytdlpBreaker.consecutiveFailures++;
+  if (ytdlpBreaker.openedAt) return;
+
+  if (ytdlpBreaker.consecutiveFailures >= CONFIG.ytdlp.breaker.failureThreshold) {
+    ytdlpBreaker.openedAt = Date.now();
+    metrics.breakerTrips++;
+    log(
+      "WARN",
+      `yt-dlp breaker: OPEN after ${ytdlpBreaker.consecutiveFailures} block errors — ` +
+        `serving from the JS API for ${openMins} min`
+    );
+  }
+}
+
+/** Human-readable state for /stats. */
+function ytdlpBreakerStatus() {
+  if (!ytdlpBreaker.openedAt) {
+    return ytdlpBreaker.consecutiveFailures > 0
+      ? `⚠️ ${ytdlpBreaker.consecutiveFailures}/${CONFIG.ytdlp.breaker.failureThreshold} gagal`
+      : "✅ normal";
+  }
+  const left = CONFIG.ytdlp.breaker.openMs - (Date.now() - ytdlpBreaker.openedAt);
+  if (left <= 0) return "🔬 probing";
+  return `⛔ terbuka (${Math.ceil(left / 1000)}s lagi)`;
 }
 
 /** Temp dirs of jobs still downloading or uploading — the periodic sweep must skip these. */
@@ -1002,6 +1099,10 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
   }
 
   metrics.ytdlpFallbacks++;
+  // Recorded here rather than after the upload: the download is what proves
+  // TikTok is answering us. The checks below can still reject this file for
+  // being audio-only, and that is not a reason to keep the breaker armed.
+  recordYtdlpSuccess();
 
   try {
     await editStatus(ctx, statusMsg, "📤 Uploading via yt-dlp…");
@@ -1134,14 +1235,22 @@ async function processUrl(ctx, url, mode = "auto") {
       let sent = false;
       let ytErrorMsg = "";
 
-      if (ytdlpAvailable) {
+      // Skip yt-dlp while the breaker is open: TikTok is blocking this IP, so
+      // the subprocess would only burn time before the API fallback runs anyway.
+      const breakerOpen = ytdlpBreakerOpen();
+
+      if (ytdlpAvailable && !breakerOpen) {
         try {
           await sendViaYtdlp(ctx, url, mode, statusMsg);
           sent = true;
         } catch (ytErr) {
           ytErrorMsg = ytErr.message;
+          recordYtdlpFailure(ytErrorMsg);
           log("WARN", `yt-dlp failed for ${username}: ${ytErrorMsg}`);
         }
+      } else if (breakerOpen) {
+        ytErrorMsg = "dilewati (TikTok sedang memblokir, pakai API)";
+        log("INFO", `yt-dlp skipped for ${username}: breaker open`);
       }
 
       if (!sent) {
@@ -1268,6 +1377,7 @@ function createBot() {
       `🎵 Audio: ${metrics.audio}`,
       `⬇️ yt-dlp downloads: ${metrics.ytdlpFallbacks}`,
       `🍪 Cookie retries: ${metrics.cookieFallbacks}`,
+      `🔌 yt-dlp breaker: ${ytdlpBreakerStatus()} (${metrics.breakerTrips}x)`,
       `⚡ Aktif: ${metrics.activeJobs}`,
       `🧠 Memory: ${mem} MB`,
       `🍪 Cookies: ${hasCookiesFile ? "✅" : "❌"}`,
