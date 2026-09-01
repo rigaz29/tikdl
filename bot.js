@@ -401,6 +401,11 @@ function ytdlpDownload(url, useCookies = false, mode = "auto") {
       "--retries", "3",
       "--no-check-certificates",
       "--no-warnings",
+      // TikTok's WAF serves a JS challenge page instead of the video page to
+      // yt-dlp's default User-Agent, so extraction fails before any download
+      // ("Unexpected response from webpage request"). A browser UA gets the
+      // real page.
+      "--user-agent", DEFAULT_HEADERS["User-Agent"],
       "--print-json",
       "-o", outputTpl,
     ];
