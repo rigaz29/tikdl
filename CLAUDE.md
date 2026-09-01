@@ -17,45 +17,64 @@ There are no configured test or lint scripts.
 - Optionally set `YTDLP_TEMP_DIR` (defaults to OS temp dir)
 - Optionally place a `cookies.txt` file in the project root for authenticated TikTok requests
 
-**External dependency:** `yt-dlp` must be installed on the system for the fallback download path to work.
+**External dependency:** `yt-dlp` must be installed on the system. For video and audio it is the *primary* download path (best quality), not just a fallback — the bot still works without it, but every video is then served by the JS API instead.
 
 ## Architecture
 
-The entire bot lives in `bot.js` (~1000 lines), organized into clearly-delineated sections:
+The entire bot lives in `bot.js` (~1500 lines), organized into clearly-delineated sections.
 
 ### Download Strategy (Cascade)
 
+Step 0 always runs first: a JS API metadata fetch (v1, 1 attempt → v2, 2 attempts with exponential backoff). It decides whether the post is a video or a slideshow, and doubles as the fallback content source. From there the path splits by content type:
+
 ```
 URL received
-  → JS API v1 (1 attempt)
-  → JS API v2 (2 attempts, with exponential backoff)
-  → yt-dlp subprocess (without cookies)
-  → yt-dlp subprocess (with cookies)
-  → Error message to user
+  → Step 0: JS API metadata (v1 → v2)
+  │
+  ├─ Slideshow (images)
+  │    → JS API only — yt-dlp cannot handle slideshows
+  │
+  └─ Video / audio (quality-first)
+       → yt-dlp without cookies
+       → yt-dlp with cookies (only if cookies.txt exists)
+       → JS API stream (no-watermark), re-fetching metadata if step 0 failed
+       → Error message to user
 ```
+
+Note the ordering: for video, **yt-dlp runs before the JS API stream**, because it yields better quality. The JS API is the safety net, not the first choice. yt-dlp is also rejected when it returns an audio-only file for a video request (a slideshow soundtrack, or a post that exposes no video format), which sends the cascade on to the JS API.
 
 ### Key Sections in `bot.js`
 
-| Lines | Section | Purpose |
-|-------|---------|---------|
-| 15–67 | `CONFIG` | All tuneable constants (timeouts, retry counts, rate limits) |
-| 100–121 | Cookie management | Loads `cookies.txt`, supports `/reload_cookies` |
-| 127–137 | Metrics | Tracks processed/failed counts, fallback rates |
-| 142–144 | Throttling | `apiLimiter` (Bottleneck) and `downloadLimiter` for concurrency |
-| 150–195 | HTTP helpers | Stream downloads with automatic cookie-retry fallback |
-| 212–248 | `fetchTikTokAPI()` | JS API caller: v1 → v2 with retry logic |
-| 254–394 | yt-dlp layer | Subprocess spawner, metadata parser, file size enforcement |
-| 399–419 | Data extractors | `getVideoUrl`, `getImageUrls`, `getAudioUrl` — handles v1/v2 API diffs |
-| 425–500 | Caption builders | Markdown captions with author/timestamp/description |
-| 540–682 | Content senders | Stream video/audio to Telegram, batch images (max 10/group) |
-| 693–772 | Main processor | Full cascade logic, group auto-delete, error reporting |
-| 778–897 | Bot setup | Commands: `/start`, `/stats`, `/audio`, `/reload_cookies` |
-| 903–929 | Cleanup loop | Removes yt-dlp temp dirs older than 1h, runs every 30min |
+Each section opens with a `// ──────` banner comment, so `grep -n '^//  ' bot.js` lists them in order with current line numbers. Listed here by banner name rather than line range, because line numbers go stale on every edit.
+
+| Banner | Purpose |
+|--------|---------|
+| `Configuration` | The `CONFIG` object — all tuneable constants (timeouts, retry counts, rate limits, file size cap) |
+| `Validation` / `Logger` | Startup token check; levelled logger, plus `logDebug` gated behind `LOG_DEBUG=1` |
+| `Cookies` | Loads `cookies.txt`, supports `/reload_cookies` |
+| `Metrics` | Tracks processed/failed counts, fallback rates |
+| `Throttling` | Bottleneck limiters (`apiLimiter`, `downloadLimiter`, `ytdlpLimiter`) and per-user job counters |
+| `HTTP helpers` | `downloadStream()` — streams with an automatic retry without cookies, and an early oversize reject |
+| `TikTok URL matching` | `TIKTOK_URL_RE` plus trailing-punctuation stripping and dedupe |
+| `PRIMARY: TikTok JS API` | `fetchTikTokAPI()` — v1 → v2 with retry logic |
+| `FALLBACK: yt-dlp (Python)` | Binary probe, subprocess spawner, stderr parser, temp-dir cleanup |
+| `Data extractors (JS API)` | `getVideoUrl`, `getImageUrls`, `getAudioUrl` — handles v1/v2 API diffs |
+| `Caption builders` | HTML captions with author/timestamp/description, plus filename sanitising |
+| `Telegram helpers` | Group detection, permission checks, status-message edit/delete |
+| `Telegram send helper with retry` | `withTelegramRetry()` — retries 429s and transient network errors |
+| `Content senders (JS API)` | Stream video/audio to Telegram, batch images (max 10/group) |
+| `Content sender (yt-dlp — primary, max quality)` | Downloads via subprocess, then uploads the temp file |
+| `Main processor — cascade logic` | `processUrl()` — full cascade, group auto-delete, error reporting |
+| `Bot setup` | Commands: `/start`, `/stats`, `/audio`, `/reload_cookies` |
+| `Periodic cleanup for yt-dlp temp files` | Removes temp dirs older than 1h, runs every 30min |
+| `Startup` | `main()`, graceful shutdown, process-level error handlers |
 
 ### Important Patterns
 
-- **Streaming-first:** Video and audio are piped directly from HTTP → Telegram without writing to disk. The yt-dlp fallback is the only path that writes temp files.
+- **Streaming-first:** On the JS API path, video and audio are piped directly from HTTP → Telegram without writing to disk. The yt-dlp path is the only one that writes temp files.
 - **TikTok API v1 vs v2:** Response schemas differ. `getVideoUrl()`, `getImageUrls()`, and `getAudioUrl()` handle both formats.
-- **Rate limiting at two levels:** Per-user rate limiter (5 req/10s via `@grammyjs/ratelimiter`) + global concurrency control (Bottleneck).
+- **yt-dlp needs a browser User-Agent:** TikTok's WAF answers yt-dlp's default UA with a JS challenge page instead of the video page, so extraction fails before any download ("Unexpected response from webpage request"). `ytdlpDownload()` passes `--user-agent` from `DEFAULT_HEADERS`. Do not remove it — no yt-dlp version fixes this, and the challenge is still intermittent even with the UA set.
+- **Rate limiting at two levels:** Per-user rate limiter (20 requests / 10s via `@grammyjs/ratelimiter`, plus a 40-job queue cap since one message can fan out into several URLs) + global concurrency control (Bottleneck).
+- **Captions use HTML parse mode,** not Markdown, and run through `escHtml()`. Only the `/start` and `/stats` command replies use Markdown.
 - **Group behavior:** In group chats, the bot auto-deletes status messages and the user's original message (2s delay) if it has `can_delete_messages` permission. This does not apply in private chats.
 - **User-facing text is in Indonesian (Bahasa Indonesia).** Log/comment language is English.
