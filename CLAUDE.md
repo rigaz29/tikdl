@@ -16,12 +16,13 @@ There are no configured test or lint scripts.
 - Create a `.env` file with `BOT_TOKEN=<telegram_bot_token>`
 - Optionally set `YTDLP_TEMP_DIR` (defaults to OS temp dir)
 - Optionally place a `cookies.txt` file in the project root for authenticated TikTok requests
+- Optionally set `INTAKE_PORT`, `INTAKE_SECRET` and `INTAKE_CHAT_ID` (plus `INTAKE_HOST`, default `0.0.0.0`) to enable the HTTP intake used by the TikTok floating-button APK
 
 **External dependency:** `yt-dlp` must be installed on the system. For video and audio it is the *primary* download path (best quality), not just a fallback — the bot still works without it, but every video is then served by the JS API instead.
 
 ## Architecture
 
-The entire bot lives in `bot.js` (~1500 lines), organized into clearly-delineated sections.
+The entire bot lives in `bot.js` (~1800 lines), organized into clearly-delineated sections.
 
 ### Download Strategy (Cascade)
 
@@ -66,6 +67,7 @@ Each section opens with a `// ──────` banner comment, so `grep -n '^
 | `Content sender (yt-dlp — primary, max quality)` | Downloads via subprocess, then uploads the temp file |
 | `Main processor — cascade logic` | `processUrl()` — full cascade, group auto-delete, error reporting |
 | `Bot setup` | Commands: `/start`, `/stats`, `/audio`, `/reload_cookies` |
+| `HTTP intake (TikTok floating-button APK)` | `POST /submit` with an HMAC-signed body, `GET /health`; builds a context for a fixed chat and runs `processUrl()` |
 | `Periodic cleanup for yt-dlp temp files` | Removes temp dirs older than 1h, runs every 30min |
 | `Startup` | `main()`, graceful shutdown, process-level error handlers |
 
@@ -77,4 +79,5 @@ Each section opens with a `// ──────` banner comment, so `grep -n '^
 - **Rate limiting at two levels:** Per-user rate limiter (20 requests / 10s via `@grammyjs/ratelimiter`, plus a 40-job queue cap since one message can fan out into several URLs) + global concurrency control (Bottleneck).
 - **Captions use HTML parse mode,** not Markdown, and run through `escHtml()`. Only the `/start` and `/stats` command replies use Markdown.
 - **Group behavior:** In group chats, the bot auto-deletes status messages and the user's original message (2s delay) if it has `can_delete_messages` permission. This does not apply in private chats.
+- **HTTP intake:** the APK signs `${timestamp}.${rawBody}` with HMAC-SHA256 using `INTAKE_SECRET` and sends `X-Timestamp` / `X-Signature`; the secret never goes over the wire, so plain HTTP is acceptable. Requests outside a 5-minute window or with an already-seen signature are rejected. The endpoint answers 202 as soon as the job is queued; results and errors go to `INTAKE_CHAT_ID` like a hand-sent link. All intake jobs share one per-user job budget (key `intake`). `processUrl()` is given a minimal context from `makeChatContext()`, so any new `ctx.*` use in the senders must be added there too.
 - **User-facing text is in Indonesian (Bahasa Indonesia).** Log/comment language is English.

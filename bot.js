@@ -11,6 +11,8 @@ const Bottleneck = require("bottleneck");
 const { PassThrough } = require("stream");
 const { spawn } = require("child_process");
 const os = require("os");
+const http = require("http");
+const crypto = require("crypto");
 
 // ──────────────────────────────────────────────
 //  Configuration
@@ -34,6 +36,7 @@ const CONFIG = {
     v1Retries: 1,
     v2Retries: 2,
     retryBackoffMs: 1_000,
+    attemptTimeoutMs: 20_000,
   },
 
   download: {
@@ -65,6 +68,17 @@ const CONFIG = {
     enabled: true,
     delayMs: 2_000,
     groupsOnly: true,
+  },
+
+  // HTTP endpoint for the TikTok floating-button APK. Off unless INTAKE_PORT
+  // and INTAKE_SECRET are both set; jobs are posted to INTAKE_CHAT_ID.
+  intake: {
+    port: Number(process.env.INTAKE_PORT) || 0,
+    host: process.env.INTAKE_HOST || "0.0.0.0",
+    secret: process.env.INTAKE_SECRET || "",
+    chatId: process.env.INTAKE_CHAT_ID || "",
+    maxSkewSec: 300,       // accepted clock difference between phone and server
+    maxBodyBytes: 4096,
   },
 
   // Measured with 10 links, two rounds each: yt-dlp at maxConcurrent 3 scored
@@ -304,6 +318,14 @@ function extractTikTokUrls(text) {
  * @param {boolean} useCookies - whether to pass cookies header
  * @returns {{ data, apiVersion }} or throws
  */
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function fetchTikTokAPI(url) {
   const versions = [
     { version: "v1", retries: CONFIG.api.v1Retries },
@@ -315,7 +337,13 @@ async function fetchTikTokAPI(url) {
   for (const { version, retries } of versions) {
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
-        const result = await Tiktok.Downloader(url, { version });
+        // The library sets no request timeout of its own; a stalled call would
+        // otherwise hold this job (and its queue slot) forever.
+        const result = await withTimeout(
+          Tiktok.Downloader(url, { version }),
+          CONFIG.api.attemptTimeoutMs,
+          `${version} request`
+        );
 
         if (result?.status === "success" && result.result) {
           return { data: result.result, apiVersion: version };
@@ -1292,7 +1320,8 @@ async function processUrl(ctx, url, mode = "auto") {
     // ── Cleanup ──────────────────────────────
     if (statusMsg) await tryDelete(ctx, statusMsg.message_id);
 
-    if (inGroup && CONFIG.autoDelete.enabled && deletable) {
+    // Intake jobs have no user message to clean up.
+    if (inGroup && CONFIG.autoDelete.enabled && deletable && originalMsgId) {
       setTimeout(() => tryDelete(ctx, originalMsgId), CONFIG.autoDelete.delayMs);
     }
 
@@ -1508,6 +1537,170 @@ function startCleanupInterval() {
 }
 
 // ──────────────────────────────────────────────
+//  HTTP intake (TikTok floating-button APK)
+//
+//  POST /submit   body: {"url": "<tiktok link>", "mode": "auto" | "audio"}
+//    X-Timestamp: unix seconds
+//    X-Signature: hex HMAC-SHA256(INTAKE_SECRET, `${timestamp}.${rawBody}`)
+//  GET /health    unauthenticated liveness check
+//
+//  The secret itself never travels with a request, so plain HTTP is
+//  acceptable: an observer sees the TikTok link but can neither forge a
+//  request nor replay one (timestamp window + seen-signature cache). The
+//  reply is 202 once the job is queued; the result or the error lands in the
+//  chat exactly like a link sent by hand.
+// ──────────────────────────────────────────────
+
+const seenSignatures = new Map(); // signature hex -> expiresAt ms
+
+function verifyIntakeRequest(timestamp, signature, rawBody) {
+  const ts = Number(timestamp);
+  if (!Number.isInteger(ts)) return "bad timestamp";
+  if (Math.abs(Date.now() / 1000 - ts) > CONFIG.intake.maxSkewSec) return "timestamp out of range";
+  if (typeof signature !== "string" || !/^[0-9a-f]{64}$/i.test(signature)) return "bad signature";
+
+  const expected = crypto
+    .createHmac("sha256", CONFIG.intake.secret)
+    .update(`${ts}.${rawBody}`)
+    .digest();
+  if (!crypto.timingSafeEqual(expected, Buffer.from(signature, "hex"))) return "bad signature";
+
+  // A signature stays valid for the whole skew window, so remember it until
+  // its timestamp can no longer pass the check above.
+  const now = Date.now();
+  for (const [sig, exp] of seenSignatures) {
+    if (exp <= now) seenSignatures.delete(sig);
+  }
+  const key = signature.toLowerCase();
+  if (seenSignatures.has(key)) return "replayed request";
+  seenSignatures.set(key, now + 2 * CONFIG.intake.maxSkewSec * 1000);
+  return null;
+}
+
+/**
+ * Just enough of a grammY context for processUrl() and the senders, aimed at
+ * a fixed chat. There is no triggering message, so message is undefined.
+ */
+function makeChatContext(bot, chat, from) {
+  const id = chat.id;
+  return {
+    api: bot.api,
+    me: bot.botInfo,
+    chat,
+    from,
+    message: undefined,
+    reply: (text, other) => bot.api.sendMessage(id, text, other),
+    replyWithDocument: (doc, other) => bot.api.sendDocument(id, doc, other),
+    replyWithPhoto: (photo, other) => bot.api.sendPhoto(id, photo, other),
+    replyWithAudio: (audio, other) => bot.api.sendAudio(id, audio, other),
+    replyWithMediaGroup: (media, other) => bot.api.sendMediaGroup(id, media, other),
+  };
+}
+
+function startIntakeServer(bot, chat) {
+  const from = { id: 0, first_name: "APK" };
+  const jobKey = "intake";
+
+  const server = http.createServer((req, res) => {
+    const reply = (status, body) => {
+      if (res.headersSent) return;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    const remote = req.socket.remoteAddress;
+    const pathname = (req.url || "").split("?")[0];
+
+    if (req.method === "GET" && pathname === "/health") {
+      return reply(200, { ok: true });
+    }
+    if (req.method !== "POST" || pathname !== "/submit") {
+      return reply(404, { ok: false, error: "not found" });
+    }
+
+    const chunks = [];
+    let size = 0;
+    let tooLarge = false;
+    req.on("data", (chunk) => {
+      if (tooLarge) return;
+      size += chunk.length;
+      if (size > CONFIG.intake.maxBodyBytes) {
+        tooLarge = true;
+        reply(413, { ok: false, error: "body too large" });
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("error", (err) => logDebug(`Intake request error: ${err.message}`));
+    req.on("end", () => {
+      if (tooLarge) return;
+      const raw = Buffer.concat(chunks).toString("utf8");
+
+      const rejected = verifyIntakeRequest(req.headers["x-timestamp"], req.headers["x-signature"], raw);
+      if (rejected) {
+        log("WARN", `Intake rejected from ${remote}: ${rejected}`);
+        return reply(401, { ok: false, error: rejected });
+      }
+
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return reply(400, { ok: false, error: "invalid JSON" });
+      }
+      const urls = extractTikTokUrls(String(body?.url ?? ""));
+      if (urls.length === 0) {
+        return reply(400, { ok: false, error: "no TikTok URL" });
+      }
+      const mode = body.mode === "audio" ? "audio" : "auto";
+
+      // All intake jobs share one queue slot budget, the same cap a single user gets.
+      if (acquireUserJobs(jobKey, 1) === 0) {
+        return reply(429, { ok: false, error: "queue full" });
+      }
+
+      const url = urls[0];
+      log("INFO", `Intake from ${remote}: ${url}`);
+      const ctx = makeChatContext(bot, chat, from);
+      processingLimiter
+        .schedule(() => processUrl(ctx, url, mode))
+        .catch((err) => log("ERROR", `Intake job failed: ${err?.message || err}`))
+        .finally(() => releaseUserJob(jobKey));
+
+      reply(202, { ok: true, queued: url });
+    });
+  });
+
+  server.requestTimeout = 15_000;
+  server.headersTimeout = 10_000;
+  server.on("error", (err) => log("ERROR", `Intake server error: ${err.message}`));
+  server.listen(CONFIG.intake.port, CONFIG.intake.host, () => {
+    log("OK", `Intake listening on ${CONFIG.intake.host}:${CONFIG.intake.port} → chat ${chat.id}`);
+  });
+  return server;
+}
+
+async function setupIntake(bot) {
+  const { port, secret, chatId } = CONFIG.intake;
+  if (!port && !secret) return null;
+  if (!port || !secret || !chatId) {
+    log("WARN", "Intake disabled: INTAKE_PORT, INTAKE_SECRET and INTAKE_CHAT_ID must all be set");
+    return null;
+  }
+  if (secret.length < 32) {
+    log("WARN", "INTAKE_SECRET is shorter than 32 characters — use a long random value");
+  }
+  try {
+    // Resolves "@username" to the numeric id and tells us whether it is a group.
+    const chat = await bot.api.getChat(chatId);
+    return startIntakeServer(bot, { id: chat.id, type: chat.type, title: chat.title });
+  } catch (err) {
+    log("ERROR", `Intake disabled: getChat(${chatId}) failed: ${err.message}`);
+    return null;
+  }
+}
+
+// ──────────────────────────────────────────────
 //  Startup
 // ──────────────────────────────────────────────
 
@@ -1565,6 +1758,8 @@ async function main() {
 
   startCleanupInterval();
 
+  const intakeServer = await setupIntake(bot);
+
   // Re-probe yt-dlp so an uninstall/install during runtime is picked up.
   setInterval(() => { checkYtdlp(); }, CONFIG.ytdlp.recheckIntervalMs);
 
@@ -1575,6 +1770,7 @@ async function main() {
     shuttingDown = true;
     log("WARN", "Shutting down…");
     if (runner.isRunning()) runner.stop();
+    if (intakeServer) intakeServer.close();
 
     // Only remove our own dl-* dirs: YTDLP_TEMP_DIR may point at a directory
     // shared with other software.
