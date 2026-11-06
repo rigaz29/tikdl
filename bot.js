@@ -147,15 +147,16 @@ function logDebug(message) {
 //  Cookies
 // ──────────────────────────────────────────────
 
+// Netscape format, read by yt-dlp only. Keep it away from downloadStream(): those
+// URLs come from the API and can point at third-party hosts, and a session
+// cookie sent there is a stolen login.
 const COOKIES_PATH = path.join(__dirname, "cookies.txt");
-let cookieString = null;
 let hasCookiesFile = false;
 
 function loadCookies() {
   try {
     if (fs.existsSync(COOKIES_PATH)) {
-      cookieString = fs.readFileSync(COOKIES_PATH, "utf8").trim();
-      hasCookiesFile = !!cookieString;
+      hasCookiesFile = fs.readFileSync(COOKIES_PATH, "utf8").trim().length > 0;
       if (hasCookiesFile) {
         log("OK", "Cookies loaded from cookies.txt");
       }
@@ -227,62 +228,44 @@ const DEFAULT_HEADERS = {
   Referer: "https://www.tiktok.com/",
 };
 
-function buildAxiosConfig(useCookies = true) {
-  const headers = { ...DEFAULT_HEADERS };
-  if (useCookies && cookieString) {
-    headers.Cookie = cookieString;
-  }
+function buildAxiosConfig() {
   return {
     timeout: CONFIG.download.timeout,
     maxRedirects: CONFIG.download.maxRedirects,
-    headers,
+    headers: { ...DEFAULT_HEADERS },
   };
 }
 
 async function downloadStream(url, maxBytes = 0) {
-  const tryDownload = async (useCookies) => {
-    const resp = await axios({
-      ...buildAxiosConfig(useCookies),
-      method: "GET",
-      url,
-      responseType: "stream",
-    });
+  const resp = await axios({
+    ...buildAxiosConfig(),
+    method: "GET",
+    url,
+    responseType: "stream",
+  });
 
-    // Reject oversized content early (before streaming the whole body) so the
-    // cascade can fall back to yt-dlp, which can select a smaller format.
-    if (maxBytes > 0) {
-      const len = Number(resp.headers["content-length"]);
-      if (Number.isFinite(len) && len > maxBytes) {
-        resp.data.destroy();
-        const e = new Error(`File too large: ${formatBytes(len)} (max ${formatBytes(maxBytes)})`);
-        e.code = "FILE_TOO_LARGE";
-        throw e;
-      }
+  // Reject oversized content early (before streaming the whole body) so the
+  // cascade can fall back to yt-dlp, which can select a smaller format.
+  if (maxBytes > 0) {
+    const len = Number(resp.headers["content-length"]);
+    if (Number.isFinite(len) && len > maxBytes) {
+      resp.data.destroy();
+      const e = new Error(`File too large: ${formatBytes(len)} (max ${formatBytes(maxBytes)})`);
+      e.code = "FILE_TOO_LARGE";
+      throw e;
     }
-
-    const pass = new PassThrough();
-    pass.on("error", (err) => log("WARN", `Stream error: ${err.message}`));
-    // If the consumer destroys the PassThrough (e.g. a failed upload), stop
-    // the underlying CDN download too instead of letting the socket linger.
-    pass.on("close", () => {
-      if (!resp.data.destroyed) resp.data.destroy();
-    });
-    resp.data.on("error", (err) => pass.destroy(err));
-    resp.data.pipe(pass);
-    return pass;
-  };
-
-  try {
-    return await tryDownload(true);
-  } catch (err) {
-    // Oversize is not an auth problem — don't waste a second request retrying.
-    if (err.code === "FILE_TOO_LARGE") throw err;
-    if (cookieString) {
-      log("WARN", `Download retry without cookies: ${err.message}`);
-      return tryDownload(false);
-    }
-    throw err;
   }
+
+  const pass = new PassThrough();
+  pass.on("error", (err) => log("WARN", `Stream error: ${err.message}`));
+  // If the consumer destroys the PassThrough (e.g. a failed upload), stop
+  // the underlying CDN download too instead of letting the socket linger.
+  pass.on("close", () => {
+    if (!resp.data.destroyed) resp.data.destroy();
+  });
+  resp.data.on("error", (err) => pass.destroy(err));
+  resp.data.pipe(pass);
+  return pass;
 }
 
 // ──────────────────────────────────────────────
@@ -315,7 +298,6 @@ function extractTikTokUrls(text) {
 /**
  * Try JS API with v1→v2 fallback.
  * @param {string} url
- * @param {boolean} useCookies - whether to pass cookies header
  * @returns {{ data, apiVersion }} or throws
  */
 function withTimeout(promise, ms, label) {
@@ -445,7 +427,6 @@ function ytdlpDownload(url, useCookies = false, mode = "auto") {
       "--max-filesize", `${maxSize}M`,
       "--socket-timeout", "30",
       "--retries", "3",
-      "--no-check-certificates",
       "--no-warnings",
       // TikTok's WAF serves a JS challenge page instead of the video page to
       // yt-dlp's default User-Agent, so extraction fails before any download
