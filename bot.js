@@ -630,14 +630,21 @@ function recordYtdlpSuccess() {
 }
 
 function recordYtdlpFailure(message) {
+  // If this download was the probe, it ends here whatever the failure was. With
+  // the flag left set, ytdlpBreakerOpen() keeps answering true and no later
+  // download can ever close the breaker.
+  const wasProbe = ytdlpBreaker.probing;
+  ytdlpBreaker.probing = false;
+
+  // A private video or an oversized file says nothing about a block, so a probe
+  // that ends this way is inconclusive and the next download probes again.
   if (!isYtdlpBlockError(message)) return;
 
   const openMins = Math.round(CONFIG.ytdlp.breaker.openMs / 60_000);
 
-  if (ytdlpBreaker.probing) {
+  if (wasProbe) {
     // Still blocked — wait another full round rather than re-counting to the
     // threshold, which would let three more subprocesses through first.
-    ytdlpBreaker.probing = false;
     ytdlpBreaker.openedAt = Date.now();
     log("WARN", `yt-dlp breaker: probe failed, staying open ${openMins} min`);
     return;
@@ -1265,7 +1272,8 @@ async function processUrl(ctx, url, mode = "auto") {
 
       // Skip yt-dlp while the breaker is open: TikTok is blocking this IP, so
       // the subprocess would only burn time before the API fallback runs anyway.
-      const breakerOpen = ytdlpBreakerOpen();
+      // Asking claims the post-cooldown probe, so only ask when yt-dlp can run it.
+      const breakerOpen = ytdlpAvailable && ytdlpBreakerOpen();
 
       if (ytdlpAvailable && !breakerOpen) {
         try {
@@ -1330,10 +1338,13 @@ async function processUrl(ctx, url, mode = "auto") {
     metrics.failed++;
     log("ERROR", `Failed for ${username}: ${err.message}`);
 
-    const errorText = `❌ Gagal mengunduh:\n${err.message}`;
+    // An intake job has no user message in the chat, so this error is the only
+    // record of the link: name it and leave it up so the post can be retried.
+    const isIntake = !originalMsgId;
+    const errorText = `❌ Gagal mengunduh:\n${isIntake ? `${url}\n` : ""}${err.message}`;
     if (statusMsg) {
       await editStatus(ctx, statusMsg, errorText);
-      setTimeout(() => tryDelete(ctx, statusMsg.message_id), 8_000);
+      if (!isIntake) setTimeout(() => tryDelete(ctx, statusMsg.message_id), 8_000);
     } else {
       await ctx.reply(errorText).catch(() => {});
     }
