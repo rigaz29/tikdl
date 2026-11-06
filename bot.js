@@ -78,7 +78,8 @@ const CONFIG = {
     secret: process.env.INTAKE_SECRET || "",
     chatId: process.env.INTAKE_CHAT_ID || "",
     maxSkewSec: 300,       // accepted clock difference between phone and server
-    maxBodyBytes: 4096,
+    maxBodyBytes: 65_536,  // a photo story carries about 1 KB of URL per image
+    jobTtlMs: 15 * 60_000, // how long a finished job stays readable through /status
   },
 
   // Measured with 10 links, two rounds each: yt-dlp at maxConcurrent 3 scored
@@ -257,6 +258,7 @@ async function downloadStream(url, maxBytes = 0) {
   }
 
   const pass = new PassThrough();
+  pass.contentLength = Number(resp.headers["content-length"]) || 0;
   pass.on("error", (err) => log("WARN", `Stream error: ${err.message}`));
   // If the consumer destroys the PassThrough (e.g. a failed upload), stop
   // the underlying CDN download too instead of letting the socket linger.
@@ -881,6 +883,7 @@ async function tryDelete(ctx, messageId) {
 }
 
 async function editStatus(ctx, msg, text) {
+  ctx.onStatus?.(text);
   try {
     await ctx.api.editMessageText(msg.chat.id, msg.message_id, text);
   } catch (err) {
@@ -949,11 +952,13 @@ async function sendVideoStream(ctx, data, apiVersion, statusMsg) {
   const maxBytes = CONFIG.download.maxFileSizeMB * 1024 * 1024;
   const caption = buildCaption(data, "video", apiVersion, "API");
   const filename = buildVideoFilename(data);
+  let size = 0;
 
   // Download inside the retry attempt: a consumed stream can't be replayed,
   // so each retry needs a fresh one.
   await withTelegramRetry(async () => {
     const stream = await downloadLimiter.schedule(() => downloadStream(videoUrl, maxBytes));
+    size = stream.contentLength;
     try {
       // Send as a document (uncompressed) — Telegram re-encodes playable videos.
       // disable_content_type_detection keeps it a plain file instead of letting
@@ -970,6 +975,7 @@ async function sendVideoStream(ctx, data, apiVersion, statusMsg) {
   });
 
   metrics.videos++;
+  return { kind: "video", size, method: "API" };
 }
 
 async function sendImages(ctx, data, apiVersion, statusMsg) {
@@ -1043,6 +1049,7 @@ async function sendImages(ctx, data, apiVersion, statusMsg) {
   }
 
   metrics.images += sentCount;
+  return { kind: "images", count: sentCount, failed: failedCount, method: "API" };
 }
 
 async function sendAudioStream(ctx, data, apiVersion, statusMsg) {
@@ -1073,6 +1080,7 @@ async function sendAudioStream(ctx, data, apiVersion, statusMsg) {
   });
 
   metrics.audio++;
+  return { kind: "audio", method: "API" };
 }
 
 // ──────────────────────────────────────────────
@@ -1183,6 +1191,7 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
       );
       metrics.videos++;
     }
+    return { kind: isAudio ? "audio" : "video", size: result.fileSize, method: "yt-dlp" };
   } finally {
     // Always clean up temp directory
     if (result.tempDir) cleanup(result.tempDir);
@@ -1202,7 +1211,93 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
 //       re-fetches metadata if step 0 failed and re-detects slideshows
 // ──────────────────────────────────────────────
 
-async function processUrl(ctx, url, mode = "auto") {
+async function sendByCascade(ctx, url, mode, statusMsg, username) {
+  // ── Step 0: JS API metadata ──────────────
+  // Detects image vs video and doubles as the fallback source if yt-dlp fails.
+  let apiData = null;
+  let apiVersion = null;
+  let apiErrorMsg = "";
+
+  try {
+    await editStatus(ctx, statusMsg, "📡 Mengambil info…");
+    const res = await apiLimiter.schedule(() => fetchTikTokAPI(url));
+    apiData = res.data;
+    apiVersion = res.apiVersion;
+    log("INFO", `JS API OK via ${apiVersion}: type=${apiData.type || "unknown"}`);
+  } catch (jsErr) {
+    apiErrorMsg = jsErr.message;
+    log("WARN", `JS API metadata failed for ${username}: ${apiErrorMsg}`);
+  }
+
+  const isImage = !!apiData && (apiData.type === "image" || apiData.images?.length > 0);
+
+  // ── Send ─────────────────────────────────
+  // Slideshows: only the JS API path handles these.
+  if (isImage && mode !== "audio") {
+    return sendImages(ctx, apiData, apiVersion, statusMsg);
+  }
+
+  // Video/audio: prefer yt-dlp for maximum quality, fall back to JS API stream.
+  let ytErrorMsg = "";
+
+  // Skip yt-dlp while the breaker is open: TikTok is blocking this IP, so
+  // the subprocess would only burn time before the API fallback runs anyway.
+  // Asking claims the post-cooldown probe, so only ask when yt-dlp can run it.
+  const breakerOpen = ytdlpAvailable && ytdlpBreakerOpen();
+
+  if (ytdlpAvailable && !breakerOpen) {
+    try {
+      return await sendViaYtdlp(ctx, url, mode, statusMsg);
+    } catch (ytErr) {
+      ytErrorMsg = ytErr.message;
+      recordYtdlpFailure(ytErrorMsg);
+      log("WARN", `yt-dlp failed for ${username}: ${ytErrorMsg}`);
+    }
+  } else if (breakerOpen) {
+    ytErrorMsg = "dilewati (TikTok sedang memblokir, pakai API)";
+    log("INFO", `yt-dlp skipped for ${username}: breaker open`);
+  }
+
+  // Step 0 may have failed transiently and yt-dlp ran for up to two
+  // minutes since — the API is the last remaining source, so give the
+  // metadata fetch (v1 → v2) one more chance before giving up.
+  if (!apiData) {
+    try {
+      await editStatus(ctx, statusMsg, "📡 Fallback ke API…");
+      const res = await apiLimiter.schedule(() => fetchTikTokAPI(url));
+      apiData = res.data;
+      apiVersion = res.apiVersion;
+      log("INFO", `JS API retry OK via ${apiVersion}: type=${apiData.type || "unknown"}`);
+    } catch (jsErr) {
+      apiErrorMsg = jsErr.message;
+    }
+  }
+
+  if (!apiData) {
+    throw new Error(
+      `Semua metode gagal.\nyt-dlp: ${ytErrorMsg || "tidak tersedia"}\nAPI: ${apiErrorMsg || "tidak ada data"}`
+    );
+  }
+
+  await editStatus(ctx, statusMsg, "📡 Fallback ke API…");
+  if (mode === "audio") {
+    return sendAudioStream(ctx, apiData, apiVersion, statusMsg);
+  }
+  if (apiData.type === "image" || apiData.images?.length > 0) {
+    // A slideshow step 0 couldn't identify (its metadata fetch failed
+    // back then): yt-dlp only grabs the soundtrack for these — which is
+    // why it was rejected above — so send the actual images.
+    return sendImages(ctx, apiData, apiVersion, statusMsg);
+  }
+  return sendVideoStream(ctx, apiData, apiVersion, statusMsg);
+}
+
+/**
+ * Runs one job and reports it in the chat. Resolves with what was delivered, or
+ * with the error, so callers that track jobs can tell how it went.
+ * @param {object|null} appMedia - API-shaped data to fall back to, see parseAppMedia()
+ */
+async function processUrl(ctx, url, mode = "auto", appMedia = null) {
   const username = ctx.from?.username || ctx.from?.first_name || "Unknown";
   const userId = ctx.from?.id;
   const inGroup = isGroup(ctx);
@@ -1223,87 +1318,18 @@ async function processUrl(ctx, url, mode = "auto") {
       deletable = await canDeleteMessages(ctx);
     }
 
-    // ── Step 0: JS API metadata ──────────────
-    // Detects image vs video and doubles as the fallback source if yt-dlp fails.
-    let apiData = null;
-    let apiVersion = null;
-    let apiErrorMsg = "";
-
+    let sent;
     try {
-      await editStatus(ctx, statusMsg, "📡 Mengambil info…");
-      const res = await apiLimiter.schedule(() => fetchTikTokAPI(url));
-      apiData = res.data;
-      apiVersion = res.apiVersion;
-      log("INFO", `JS API OK via ${apiVersion}: type=${apiData.type || "unknown"}`);
-    } catch (jsErr) {
-      apiErrorMsg = jsErr.message;
-      log("WARN", `JS API metadata failed for ${username}: ${apiErrorMsg}`);
-    }
-
-    const isImage = !!apiData && (apiData.type === "image" || apiData.images?.length > 0);
-
-    // ── Send ─────────────────────────────────
-    if (isImage && mode !== "audio") {
-      // Slideshows: only the JS API path handles these.
-      await sendImages(ctx, apiData, apiVersion, statusMsg);
-    } else {
-      // Video/audio: prefer yt-dlp for maximum quality, fall back to JS API stream.
-      let sent = false;
-      let ytErrorMsg = "";
-
-      // Skip yt-dlp while the breaker is open: TikTok is blocking this IP, so
-      // the subprocess would only burn time before the API fallback runs anyway.
-      // Asking claims the post-cooldown probe, so only ask when yt-dlp can run it.
-      const breakerOpen = ytdlpAvailable && ytdlpBreakerOpen();
-
-      if (ytdlpAvailable && !breakerOpen) {
-        try {
-          await sendViaYtdlp(ctx, url, mode, statusMsg);
-          sent = true;
-        } catch (ytErr) {
-          ytErrorMsg = ytErr.message;
-          recordYtdlpFailure(ytErrorMsg);
-          log("WARN", `yt-dlp failed for ${username}: ${ytErrorMsg}`);
-        }
-      } else if (breakerOpen) {
-        ytErrorMsg = "dilewati (TikTok sedang memblokir, pakai API)";
-        log("INFO", `yt-dlp skipped for ${username}: breaker open`);
-      }
-
-      if (!sent) {
-        // Step 0 may have failed transiently and yt-dlp ran for up to two
-        // minutes since — the API is the last remaining source, so give the
-        // metadata fetch (v1 → v2) one more chance before giving up.
-        if (!apiData) {
-          try {
-            await editStatus(ctx, statusMsg, "📡 Fallback ke API…");
-            const res = await apiLimiter.schedule(() => fetchTikTokAPI(url));
-            apiData = res.data;
-            apiVersion = res.apiVersion;
-            log("INFO", `JS API retry OK via ${apiVersion}: type=${apiData.type || "unknown"}`);
-          } catch (jsErr) {
-            apiErrorMsg = jsErr.message;
-          }
-        }
-
-        if (!apiData) {
-          throw new Error(
-            `Semua metode gagal.\nyt-dlp: ${ytErrorMsg || "tidak tersedia"}\nAPI: ${apiErrorMsg || "tidak ada data"}`
-          );
-        }
-
-        await editStatus(ctx, statusMsg, "📡 Fallback ke API…");
-        if (mode === "audio") {
-          await sendAudioStream(ctx, apiData, apiVersion, statusMsg);
-        } else if (apiData.type === "image" || apiData.images?.length > 0) {
-          // A slideshow step 0 couldn't identify (its metadata fetch failed
-          // back then): yt-dlp only grabs the soundtrack for these — which is
-          // why it was rejected above — so send the actual images.
-          await sendImages(ctx, apiData, apiVersion, statusMsg);
-        } else {
-          await sendVideoStream(ctx, apiData, apiVersion, statusMsg);
-        }
-      }
+      sent = await sendByCascade(ctx, url, mode, statusMsg, username);
+    } catch (err) {
+      if (!appMedia) throw err;
+      // The web link cannot reach everything the app can show: friends-only
+      // stories, and photo stories that yt-dlp does not read.
+      log("WARN", `Cascade failed for ${username}, using the app's media: ${err.message}`);
+      await editStatus(ctx, statusMsg, "📲 Mengunduh media dari aplikasi…");
+      sent = await (appMedia.images.length > 0
+        ? sendImages(ctx, appMedia, "story", statusMsg)
+        : sendVideoStream(ctx, appMedia, "story", statusMsg));
     }
 
     // ── Cleanup ──────────────────────────────
@@ -1315,6 +1341,7 @@ async function processUrl(ctx, url, mode = "auto") {
     }
 
     log("OK", `Done for ${username}`);
+    return { ok: true, ...sent };
   } catch (err) {
     metrics.failed++;
     log("ERROR", `Failed for ${username}: ${err.message}`);
@@ -1329,6 +1356,7 @@ async function processUrl(ctx, url, mode = "auto") {
     } else {
       await ctx.reply(errorText).catch(() => {});
     }
+    return { ok: false, error: err.message };
   } finally {
     metrics.activeJobs--;
   }
@@ -1531,21 +1559,23 @@ function startCleanupInterval() {
 // ──────────────────────────────────────────────
 //  HTTP intake (TikTok floating-button APK)
 //
-//  POST /submit   body: {"url": "<tiktok link>", "mode": "auto" | "audio"}
+//  POST /submit       body: {"url": "<tiktok link>", "mode": "auto" | "audio",
+//                            "media": {see parseAppMedia}}
 //    X-Timestamp: unix seconds
 //    X-Signature: hex HMAC-SHA256(INTAKE_SECRET, `${timestamp}.${rawBody}`)
-//  GET /health    unauthenticated liveness check
+//  GET /status/<job>  the job's progress; signs `${timestamp}.status:<job>`
+//  GET /health        unauthenticated liveness check
 //
 //  The secret itself never travels with a request, so plain HTTP is
 //  acceptable: an observer sees the TikTok link but can neither forge a
-//  request nor replay one (timestamp window + seen-signature cache). The
-//  reply is 202 once the job is queued; the result or the error lands in the
-//  chat exactly like a link sent by hand.
+//  request nor replay a submit (timestamp window + seen-signature cache). The
+//  reply is 202 once the job is queued, with a job id to follow; the result or
+//  the error also lands in the chat exactly like a link sent by hand.
 // ──────────────────────────────────────────────
 
 const seenSignatures = new Map(); // signature hex -> expiresAt ms
 
-function verifyIntakeRequest(timestamp, signature, rawBody) {
+function checkIntakeSignature(timestamp, signature, payload) {
   const ts = Number(timestamp);
   if (!Number.isInteger(ts)) return "bad timestamp";
   if (Math.abs(Date.now() / 1000 - ts) > CONFIG.intake.maxSkewSec) return "timestamp out of range";
@@ -1553,9 +1583,15 @@ function verifyIntakeRequest(timestamp, signature, rawBody) {
 
   const expected = crypto
     .createHmac("sha256", CONFIG.intake.secret)
-    .update(`${ts}.${rawBody}`)
+    .update(`${ts}.${payload}`)
     .digest();
   if (!crypto.timingSafeEqual(expected, Buffer.from(signature, "hex"))) return "bad signature";
+  return null;
+}
+
+function verifyIntakeRequest(timestamp, signature, rawBody) {
+  const rejected = checkIntakeSignature(timestamp, signature, rawBody);
+  if (rejected) return rejected;
 
   // A signature stays valid for the whole skew window, so remember it until
   // its timestamp can no longer pass the check above.
@@ -1569,11 +1605,78 @@ function verifyIntakeRequest(timestamp, signature, rawBody) {
   return null;
 }
 
+const intakeJobs = new Map(); // job id -> progress of a post sent by the APK
+
+function createIntakeJob() {
+  const now = Date.now();
+  for (const [id, job] of intakeJobs) {
+    if (job.finishedAt && now - job.finishedAt > CONFIG.intake.jobTtlMs) intakeJobs.delete(id);
+  }
+  const job = {
+    id: crypto.randomBytes(8).toString("hex"),
+    state: "queued",
+    detail: "",
+    error: "",
+    result: {},
+    startedAt: now,
+    finishedAt: 0,
+  };
+  intakeJobs.set(job.id, job);
+  return job;
+}
+
+function finishIntakeJob(job, { ok, error, ...result }) {
+  job.state = ok ? "done" : "failed";
+  job.detail = "";
+  job.error = error || "";
+  job.result = result;
+  job.finishedAt = Date.now();
+}
+
+function intakeJobView(job, chat) {
+  const seconds = Math.round(((job.finishedAt || Date.now()) - job.startedAt) / 1000);
+  return { ok: true, state: job.state, detail: job.detail, error: job.error, chat: chat.title, seconds, ...job.result };
+}
+
+const TIKTOK_MEDIA_HOST_RE = /(^|\.)(tiktokcdn(-\w+)?\.com|ibyteimg\.com|byteimg\.com|muscdn\.com)$/i;
+
+function isTikTokMediaUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && TIKTOK_MEDIA_HOST_RE.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Turns the media the APK read off a story into the shape the JS API senders
+ * take, or null when there is nothing usable. The hosts are checked because the
+ * server fetches these URLs and posts whatever comes back to the chat.
+ * @param {{video?: string, images?: string[], id?: string, author?: string, desc?: string, time?: number}} media
+ */
+function parseAppMedia(media, url) {
+  if (!media || typeof media !== "object") return null;
+  const video = isTikTokMediaUrl(media.video) ? media.video : null;
+  const images = (Array.isArray(media.images) ? media.images : []).filter(isTikTokMediaUrl);
+  if (!video && images.length === 0) return null;
+  return {
+    type: images.length > 0 ? "image" : "video",
+    id: String(media.id ?? ""),
+    url,
+    desc: String(media.desc ?? ""),
+    createTime: Number(media.time) || 0,
+    author: { uniqueId: String(media.author ?? "") },
+    video: { playAddr: video },
+    images,
+  };
+}
+
 /**
  * Just enough of a grammY context for processUrl() and the senders, aimed at
  * a fixed chat. There is no triggering message, so message is undefined.
  */
-function makeChatContext(bot, chat, from) {
+function makeChatContext(bot, chat, from, onStatus) {
   const id = chat.id;
   return {
     api: bot.api,
@@ -1581,6 +1684,7 @@ function makeChatContext(bot, chat, from) {
     chat,
     from,
     message: undefined,
+    onStatus,
     reply: (text, other) => bot.api.sendMessage(id, text, other),
     replyWithDocument: (doc, other) => bot.api.sendDocument(id, doc, other),
     replyWithPhoto: (photo, other) => bot.api.sendPhoto(id, photo, other),
@@ -1604,6 +1708,18 @@ function startIntakeServer(bot, chat) {
 
     if (req.method === "GET" && pathname === "/health") {
       return reply(200, { ok: true });
+    }
+    const status = req.method === "GET" && /^\/status\/([0-9a-f]{16})$/.exec(pathname);
+    if (status) {
+      // Read-only and polled, so no replay cache: two polls in one second carry
+      // the same signature.
+      const rejected = checkIntakeSignature(req.headers["x-timestamp"], req.headers["x-signature"], `status:${status[1]}`);
+      if (rejected) {
+        log("WARN", `Status rejected from ${remote}: ${rejected}`);
+        return reply(401, { ok: false, error: rejected });
+      }
+      const job = intakeJobs.get(status[1]);
+      return job ? reply(200, intakeJobView(job, chat)) : reply(404, { ok: false, error: "unknown job" });
     }
     if (req.method !== "POST" || pathname !== "/submit") {
       return reply(404, { ok: false, error: "not found" });
@@ -1653,13 +1769,23 @@ function startIntakeServer(bot, chat) {
 
       const url = urls[0];
       log("INFO", `Intake from ${remote}: ${url}`);
-      const ctx = makeChatContext(bot, chat, from);
+      const job = createIntakeJob();
+      const ctx = makeChatContext(bot, chat, from, (text) => {
+        job.detail = text.replace(/^[^\p{L}\p{N}]+/u, ""); // the emoji is for the chat
+      });
       processingLimiter
-        .schedule(() => processUrl(ctx, url, mode))
-        .catch((err) => log("ERROR", `Intake job failed: ${err?.message || err}`))
+        .schedule(() => {
+          job.state = "running";
+          return processUrl(ctx, url, mode, parseAppMedia(body.media, url));
+        })
+        .then((result) => finishIntakeJob(job, result))
+        .catch((err) => {
+          log("ERROR", `Intake job failed: ${err?.message || err}`);
+          finishIntakeJob(job, { ok: false, error: err?.message || String(err) });
+        })
         .finally(() => releaseUserJob(jobKey));
 
-      reply(202, { ok: true, queued: url });
+      reply(202, { ok: true, queued: url, job: job.id, chat: chat.title });
     });
   });
 
