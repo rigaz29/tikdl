@@ -44,6 +44,8 @@ const CONFIG = {
     maxRedirects: 10,
     maxUrlsPerMessage: 20,
     maxFileSizeMB: 50,
+    attempts: 3,            // tries per post before the job counts as failed
+    retryBackoffMs: 3_000,  // wait before try 2; try 3 waits twice as long
   },
 
   ytdlp: {
@@ -80,6 +82,7 @@ const CONFIG = {
     maxSkewSec: 300,       // accepted clock difference between phone and server
     maxBodyBytes: 65_536,  // a photo story carries about 1 KB of URL per image
     jobTtlMs: 15 * 60_000, // how long a finished job stays readable through /status
+    maxConcurrent: 3,      // posts worked on at once; the rest wait in line, without a limit
   },
 
   // Measured with 10 links, two rounds each: yt-dlp at maxConcurrent 3 scored
@@ -104,6 +107,11 @@ const CONFIG = {
     },
     ytdlp: {
       maxConcurrent: 3,
+    },
+    // Telegram allows about 20 messages a minute in one group. Going faster
+    // only earns 429s, and each 429 on an upload means fetching the file again.
+    groupSend: {
+      minTime: 3_100,
     },
   },
 };
@@ -196,6 +204,8 @@ const apiLimiter = new Bottleneck(CONFIG.throttle.api);
 const downloadLimiter = new Bottleneck(CONFIG.throttle.download);
 const processingLimiter = new Bottleneck(CONFIG.throttle.process);
 const ytdlpLimiter = new Bottleneck(CONFIG.throttle.ytdlp);
+const intakeLimiter = new Bottleneck({ maxConcurrent: CONFIG.intake.maxConcurrent });
+const groupSendLimiters = new Bottleneck.Group(CONFIG.throttle.groupSend);
 
 // Per-user cap on queued+running jobs — without this, a user staying under
 // the message rate limit could still queue hundreds of jobs (20 msg/10s ×
@@ -884,6 +894,7 @@ async function tryDelete(ctx, messageId) {
 
 async function editStatus(ctx, msg, text) {
   ctx.onStatus?.(text);
+  if (!msg) return;
   try {
     await ctx.api.editMessageText(msg.chat.id, msg.message_id, text);
   } catch (err) {
@@ -920,22 +931,52 @@ function isTransientTelegramError(err) {
  * attempt cannot be replayed, so reusing one would send an empty/corrupt file.
  */
 async function withTelegramRetry(makeAttempt, maxRetries = 3) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  let failures = 0;
+  for (;;) {
     try {
       return await makeAttempt();
     } catch (err) {
-      if (attempt >= maxRetries || !isTransientTelegramError(err)) throw err;
-
-      let waitMs;
+      // A flood limit only means "later", so waiting it out never uses up a try.
       if (err instanceof GrammyError && err.error_code === 429) {
-        waitMs = ((err.parameters?.retry_after ?? 5) + 1) * 1000;
-        log("WARN", `Telegram flood limit (429), retry in ${waitMs}ms (attempt ${attempt}/${maxRetries})`);
-      } else {
-        waitMs = 1000 * 2 ** (attempt - 1);
-        log("WARN", `Transient send error: ${err.message} — retry in ${waitMs}ms (attempt ${attempt}/${maxRetries})`);
+        const waitMs = floodWaitMs(err.parameters);
+        log("WARN", `Telegram flood limit (429), retry in ${waitMs}ms`);
+        await sleep(waitMs);
+        continue;
       }
+      failures++;
+      if (failures >= maxRetries || !isTransientTelegramError(err)) throw err;
+      const waitMs = 1000 * 2 ** (failures - 1);
+      log("WARN", `Transient send error: ${err.message} — retry in ${waitMs}ms (attempt ${failures}/${maxRetries})`);
       await sleep(waitMs);
     }
+  }
+}
+
+function floodWaitMs(parameters) {
+  return ((parameters?.retry_after ?? 5) + 1) * 1000;
+}
+
+/** An upload to a group is one message against that group's limit, so they take turns. */
+function uploadWithRetry(ctx, makeAttempt) {
+  return withTelegramRetry(() =>
+    ctx.chat.id < 0 ? groupSendLimiters.key(String(ctx.chat.id)).schedule(makeAttempt) : makeAttempt()
+  );
+}
+
+const UPLOAD_METHODS = new Set(["sendDocument", "sendPhoto", "sendAudio", "sendMediaGroup"]);
+
+/**
+ * grammY API transformer: status messages and deletions wait out a flood limit
+ * here. Uploads are left to uploadWithRetry(), since retrying one needs a fresh
+ * stream and this level would resend a consumed one.
+ */
+async function waitOutFloodLimit(prev, method, payload, signal) {
+  for (;;) {
+    const result = await prev(method, payload, signal);
+    if (result.ok || result.error_code !== 429 || UPLOAD_METHODS.has(method)) return result;
+    const waitMs = floodWaitMs(result.parameters);
+    log("WARN", `Telegram flood limit on ${method}, retry in ${waitMs}ms`);
+    await sleep(waitMs);
   }
 }
 
@@ -956,7 +997,7 @@ async function sendVideoStream(ctx, data, apiVersion, statusMsg) {
 
   // Download inside the retry attempt: a consumed stream can't be replayed,
   // so each retry needs a fresh one.
-  await withTelegramRetry(async () => {
+  await uploadWithRetry(ctx, async () => {
     const stream = await downloadLimiter.schedule(() => downloadStream(videoUrl, maxBytes));
     size = stream.contentLength;
     try {
@@ -998,7 +1039,7 @@ async function sendImages(ctx, data, apiVersion, statusMsg) {
     // Download inside the retry attempt: a consumed stream can't be replayed,
     // so each retry needs fresh ones. On a failed send every stream of the
     // batch is destroyed so the CDN sockets don't linger.
-    const batchResult = await withTelegramRetry(async () => {
+    const batchResult = await uploadWithRetry(ctx, async () => {
       const settled = await Promise.allSettled(
         batchUrls.map((url) => downloadLimiter.schedule(() => downloadStream(url)))
       );
@@ -1064,7 +1105,7 @@ async function sendAudioStream(ctx, data, apiVersion, statusMsg) {
   const caption = buildCaption(data, "audio", apiVersion, "API");
 
   // Download inside the retry attempt: a consumed stream can't be replayed.
-  await withTelegramRetry(async () => {
+  await uploadWithRetry(ctx, async () => {
     const stream = await downloadLimiter.schedule(() => downloadStream(audioUrl, maxBytes));
     try {
       return await ctx.replyWithAudio(new InputFile(stream), {
@@ -1165,7 +1206,7 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
       const title = result.metadata?.title || "TikTok Audio";
       const artist = result.metadata?.uploader || "Unknown";
 
-      await withTelegramRetry(() =>
+      await uploadWithRetry(ctx, () =>
         sendFile((fileStream) =>
           ctx.replyWithAudio(new InputFile(fileStream, filename), {
             title,
@@ -1180,7 +1221,7 @@ async function sendViaYtdlp(ctx, url, mode, statusMsg) {
       // Send as a document (uncompressed) — Telegram re-encodes playable videos.
       // disable_content_type_detection keeps it a plain file instead of an
       // inline playable video.
-      await withTelegramRetry(() =>
+      await uploadWithRetry(ctx, () =>
         sendFile((fileStream) =>
           ctx.replyWithDocument(new InputFile(fileStream, filename), {
             caption,
@@ -1312,24 +1353,40 @@ async function processUrl(ctx, url, mode = "auto", appMedia = null) {
   let deletable = false;
 
   try {
-    statusMsg = await ctx.reply("⚡ Memproses link TikTok…");
+    // The phone follows an intake job by itself, and a status message per post
+    // is what runs a busy group into Telegram's flood limit.
+    if (!ctx.silent) statusMsg = await ctx.reply("⚡ Memproses link TikTok…");
 
-    if (inGroup && CONFIG.autoDelete.enabled) {
+    if (inGroup && CONFIG.autoDelete.enabled && originalMsgId) {
       deletable = await canDeleteMessages(ctx);
     }
 
+    const sendOnce = async () => {
+      try {
+        return await sendByCascade(ctx, url, mode, statusMsg, username);
+      } catch (err) {
+        if (!appMedia) throw err;
+        // The web link cannot reach everything the app can show: friends-only
+        // stories, and photo stories that yt-dlp does not read.
+        log("WARN", `Cascade failed for ${username}, using the app's media: ${err.message}`);
+        await editStatus(ctx, statusMsg, "📲 Mengunduh media dari aplikasi…");
+        return appMedia.images.length > 0
+          ? sendImages(ctx, appMedia, "story", statusMsg)
+          : sendVideoStream(ctx, appMedia, "story", statusMsg);
+      }
+    };
+
     let sent;
-    try {
-      sent = await sendByCascade(ctx, url, mode, statusMsg, username);
-    } catch (err) {
-      if (!appMedia) throw err;
-      // The web link cannot reach everything the app can show: friends-only
-      // stories, and photo stories that yt-dlp does not read.
-      log("WARN", `Cascade failed for ${username}, using the app's media: ${err.message}`);
-      await editStatus(ctx, statusMsg, "📲 Mengunduh media dari aplikasi…");
-      sent = await (appMedia.images.length > 0
-        ? sendImages(ctx, appMedia, "story", statusMsg)
-        : sendVideoStream(ctx, appMedia, "story", statusMsg));
+    for (let attempt = 1; !sent; attempt++) {
+      try {
+        sent = await sendOnce();
+      } catch (err) {
+        // A post over the size cap will still be over it on the next try.
+        if (attempt >= CONFIG.download.attempts || err.code === "FILE_TOO_LARGE") throw err;
+        log("WARN", `Try ${attempt}/${CONFIG.download.attempts} failed for ${username}: ${err.message}`);
+        await editStatus(ctx, statusMsg, `🔁 Mencoba ulang (${attempt + 1}/${CONFIG.download.attempts})…`);
+        await sleep(CONFIG.download.retryBackoffMs * attempt);
+      }
     }
 
     // ── Cleanup ──────────────────────────────
@@ -1368,6 +1425,7 @@ async function processUrl(ctx, url, mode = "auto", appMedia = null) {
 
 function createBot() {
   const bot = new Bot(CONFIG.bot.token);
+  bot.api.config.use(waitOutFloodLimit);
 
   // ── Middleware ────────────────────────────
 
@@ -1563,14 +1621,16 @@ function startCleanupInterval() {
 //                            "media": {see parseAppMedia}}
 //    X-Timestamp: unix seconds
 //    X-Signature: hex HMAC-SHA256(INTAKE_SECRET, `${timestamp}.${rawBody}`)
-//  GET /status/<job>  the job's progress; signs `${timestamp}.status:<job>`
+//  GET /status/<job>[,<job>...]  the jobs' progress, in one reply;
+//                     signs `${timestamp}.status:<same list>`
 //  GET /health        unauthenticated liveness check
 //
 //  The secret itself never travels with a request, so plain HTTP is
 //  acceptable: an observer sees the TikTok link but can neither forge a
 //  request nor replay a submit (timestamp window + seen-signature cache). The
-//  reply is 202 once the job is queued, with a job id to follow; the result or
-//  the error also lands in the chat exactly like a link sent by hand.
+//  reply is 202 once the job is queued, with a job id to follow. Jobs wait in
+//  line with no limit on their number. The result lands in the chat; so does an
+//  error, with its link.
 // ──────────────────────────────────────────────
 
 const seenSignatures = new Map(); // signature hex -> expiresAt ms
@@ -1684,6 +1744,7 @@ function makeChatContext(bot, chat, from, onStatus) {
     chat,
     from,
     message: undefined,
+    silent: true,
     onStatus,
     reply: (text, other) => bot.api.sendMessage(id, text, other),
     replyWithDocument: (doc, other) => bot.api.sendDocument(id, doc, other),
@@ -1695,7 +1756,6 @@ function makeChatContext(bot, chat, from, onStatus) {
 
 function startIntakeServer(bot, chat) {
   const from = { id: 0, first_name: "APK" };
-  const jobKey = "intake";
 
   const server = http.createServer((req, res) => {
     const reply = (status, body) => {
@@ -1709,7 +1769,7 @@ function startIntakeServer(bot, chat) {
     if (req.method === "GET" && pathname === "/health") {
       return reply(200, { ok: true });
     }
-    const status = req.method === "GET" && /^\/status\/([0-9a-f]{16})$/.exec(pathname);
+    const status = req.method === "GET" && /^\/status\/([0-9a-f]{16}(?:,[0-9a-f]{16})*)$/.exec(pathname);
     if (status) {
       // Read-only and polled, so no replay cache: two polls in one second carry
       // the same signature.
@@ -1718,8 +1778,13 @@ function startIntakeServer(bot, chat) {
         log("WARN", `Status rejected from ${remote}: ${rejected}`);
         return reply(401, { ok: false, error: rejected });
       }
-      const job = intakeJobs.get(status[1]);
-      return job ? reply(200, intakeJobView(job, chat)) : reply(404, { ok: false, error: "unknown job" });
+      // A job the server no longer knows is simply left out of the reply.
+      const jobs = {};
+      for (const id of status[1].split(",")) {
+        const job = intakeJobs.get(id);
+        if (job) jobs[id] = intakeJobView(job, chat);
+      }
+      return reply(200, { ok: true, jobs });
     }
     if (req.method !== "POST" || pathname !== "/submit") {
       return reply(404, { ok: false, error: "not found" });
@@ -1762,18 +1827,13 @@ function startIntakeServer(bot, chat) {
       }
       const mode = body.mode === "audio" ? "audio" : "auto";
 
-      // All intake jobs share one queue slot budget, the same cap a single user gets.
-      if (acquireUserJobs(jobKey, 1) === 0) {
-        return reply(429, { ok: false, error: "queue full" });
-      }
-
       const url = urls[0];
       log("INFO", `Intake from ${remote}: ${url}`);
       const job = createIntakeJob();
       const ctx = makeChatContext(bot, chat, from, (text) => {
         job.detail = text.replace(/^[^\p{L}\p{N}]+/u, ""); // the emoji is for the chat
       });
-      processingLimiter
+      intakeLimiter
         .schedule(() => {
           job.state = "running";
           return processUrl(ctx, url, mode, parseAppMedia(body.media, url));
@@ -1782,8 +1842,7 @@ function startIntakeServer(bot, chat) {
         .catch((err) => {
           log("ERROR", `Intake job failed: ${err?.message || err}`);
           finishIntakeJob(job, { ok: false, error: err?.message || String(err) });
-        })
-        .finally(() => releaseUserJob(jobKey));
+        });
 
       reply(202, { ok: true, queued: url, job: job.id, chat: chat.title });
     });
